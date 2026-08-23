@@ -8,12 +8,20 @@ on:
 jobs:
   quality:
     runs-on: ubuntu-latest
+    env:
+      PYTHONPATH: .
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-      - run: pip install pytest ruff
-      - run: ruff check service_design.py tests
+      - run: pip install -e ".[dev]"
+      - run: ruff check service_design.py app tests
       - run: pytest -q
       - run: python service_design.py
+
+  container:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: docker build -t human-agent-service-design:ci .
