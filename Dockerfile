@@ -7,6 +7,7 @@ WORKDIR /app
 COPY pyproject.toml ./
 COPY service_design.py ./
 COPY app ./app
+COPY human_agent ./human_agent
 RUN pip install --no-cache-dir .
 
 EXPOSE 8000

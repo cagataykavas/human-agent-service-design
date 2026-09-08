@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "human-agent-service-design"
-version = "0.2.0"
+version = "0.3.0"
 description = "Policy routing and experiment toolkit for human-agent collaboration"
 requires-python = ">=3.11"
 dependencies = ["fastapi>=0.115", "uvicorn[standard]>=0.30", "pydantic>=2.8"]
@@ -14,7 +14,7 @@ dev = ["pytest>=8.0", "httpx>=0.27", "ruff>=0.6"]
 
 [tool.setuptools]
 py-modules = ["service_design"]
-packages = ["app"]
+packages = ["app", "human_agent"]
 
 [tool.ruff]
 line-length = 100
