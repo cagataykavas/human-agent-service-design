@@ -24,8 +24,8 @@ jobs:
       - name: Verify wheel outside source tree
         run: |
           python -m venv /tmp/wheelcheck
-          /tmp/wheelcheck/bin/pip install /tmp/dist/*.whl
           cd /tmp
+          /tmp/wheelcheck/bin/pip install /tmp/dist/*.whl
           /tmp/wheelcheck/bin/python -c "from human_agent import CaseWorkflow, ReviewQueue; print(CaseWorkflow, ReviewQueue)"
 
   container:
