@@ -1,9 +1,9 @@
 from __future__ import annotations
 
 import heapq
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
-from typing import Callable
 
 
 @dataclass(order=True, slots=True)

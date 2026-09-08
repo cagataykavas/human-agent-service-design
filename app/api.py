@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import asdict
+
 from fastapi import FastAPI
 from pydantic import BaseModel, Field
 
