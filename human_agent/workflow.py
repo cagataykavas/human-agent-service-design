@@ -45,9 +45,9 @@ class CaseWorkflow:
         ledger: AuditLedger | None = None,
         review_queue: ReviewQueue | None = None,
     ) -> None:
-        self.router = router or PolicyRouter()
-        self.ledger = ledger or AuditLedger()
-        self.review_queue = review_queue or ReviewQueue()
+        self.router = router if router is not None else PolicyRouter()
+        self.ledger = ledger if ledger is not None else AuditLedger()
+        self.review_queue = review_queue if review_queue is not None else ReviewQueue()
         self._records: dict[str, CaseRecord] = {}
         self._lock = threading.RLock()
 
