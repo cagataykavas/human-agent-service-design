@@ -16,12 +16,22 @@ jobs:
         with:
           python-version: "3.12"
       - run: pip install -e ".[dev]"
-      - run: ruff check service_design.py app tests
+      - run: ruff check .
       - run: pytest -q
       - run: python service_design.py
+      - name: Build installable wheel
+        run: python -m pip wheel . --no-deps --wheel-dir /tmp/dist
+      - name: Verify wheel outside source tree
+        run: |
+          python -m venv /tmp/wheelcheck
+          /tmp/wheelcheck/bin/pip install /tmp/dist/*.whl
+          cd /tmp
+          /tmp/wheelcheck/bin/python -c "from human_agent import CaseWorkflow, ReviewQueue; print(CaseWorkflow, ReviewQueue)"
 
   container:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - run: docker build -t human-agent-service-design:ci .
+      - name: Verify packaged application import
+        run: docker run --rm human-agent-service-design:ci python -c "from app.api import app; print(app.title)"
