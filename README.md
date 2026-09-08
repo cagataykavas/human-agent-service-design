@@ -79,10 +79,43 @@ Each workflow produces an audit event containing the agent recommendation, polic
 
 ```text
 human-agent-service-design/
-├── service_design.py          # domain model, policy router and metrics
+├── human_agent/
+│   ├── domain.py              # validated case, evidence and recommendation model
+│   ├── policy.py              # explicit automation and escalation policy
+│   ├── workflow.py            # versioned case lifecycle and review commands
+│   ├── review_queue.py        # SLA-aware priority queue and expiring leases
+│   ├── audit.py               # append-only hash-chained event ledger
+│   └── metrics.py             # operational outcome projections
+├── app/api.py                 # FastAPI policy and experiment boundary
+├── service_design.py          # compatibility facade for original imports
 ├── reviewer_cockpit.html      # static portfolio prototype
-└── README.md
+└── tests/                     # policy, API, lifecycle and concurrency invariants
 ```
+
+## Operational case lifecycle
+
+The package now models the state around a recommendation rather than stopping at a
+stateless routing response:
+
+```mermaid
+stateDiagram-v2
+    [*] --> Received
+    Received --> Decided: safe automation
+    Received --> AwaitingCustomer: missing evidence
+    Received --> QueuedForReview: policy escalation
+    QueuedForReview --> UnderReview: reviewer lease
+    UnderReview --> Decided: approve or reject
+```
+
+Every mutation uses an expected case version, preventing a stale reviewer screen from
+silently overwriting a newer decision. Human-review items are ordered by policy priority
+and SLA deadline, leased to one reviewer for a bounded period, and returned to the queue
+when the lease expires. Completed decisions append a hash-chained audit event recording
+the actor, rationale, agent override and prior event hash.
+
+These are in-memory reference implementations with explicit production mappings. A real
+deployment would persist case versions transactionally, use a shared queue, and write the
+audit stream to durable append-only storage.
 
 ## Example policies
 
@@ -108,6 +141,10 @@ This lab intentionally reports both AI and service metrics:
 - **review burden** — weighted queue load;
 - **high-impact auto-decision rate** — useful guardrail metric;
 - **explanation coverage** — decisions with an actionable customer explanation.
+
+The regression suite also protects operational invariants: stale-version rejection,
+reviewer lease ownership, expired-lease recovery, invalid state transitions, evidence
+provenance, override attribution and audit-chain verification.
 
 ## Run
 
