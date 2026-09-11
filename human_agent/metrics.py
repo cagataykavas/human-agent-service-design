@@ -45,9 +45,7 @@ def summarize_outcomes(outcomes: Iterable[ReviewOutcome]) -> ServiceMetrics:
         automation_rate=sum(row.route is Route.AUTOMATE for row in rows) / cases,
         human_review_rate=len(review_rows) / cases,
         override_rate=(
-            sum(row.overridden for row in review_rows) / len(review_rows)
-            if review_rows
-            else 0.0
+            sum(row.overridden for row in review_rows) / len(review_rows) if review_rows else 0.0
         ),
         request_more_info_rate=sum(row.route is Route.ASK_CUSTOMER for row in rows) / cases,
         average_decision_seconds=mean(row.decision_seconds for row in rows),

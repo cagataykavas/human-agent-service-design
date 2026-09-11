@@ -53,9 +53,7 @@ class PolicyRouter:
 
         if case.evidence_completeness < self.config.min_evidence_completeness:
             missing = sorted(
-                field_name
-                for evidence in case.evidence
-                for field_name in evidence.missing_fields
+                field_name for evidence in case.evidence for field_name in evidence.missing_fields
             )
             missing_text = ", ".join(dict.fromkeys(missing)) or "additional evidence"
             return RoutingDecision(

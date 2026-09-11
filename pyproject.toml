@@ -4,17 +4,24 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "human-agent-service-design"
-version = "0.3.0"
-description = "Policy routing and experiment toolkit for human-agent collaboration"
+version = "1.0.0"
+description = "Audited human-agent case lifecycle and agent-assisted service desk"
 requires-python = ">=3.11"
 dependencies = ["fastapi>=0.115", "uvicorn[standard]>=0.30", "pydantic>=2.8"]
 
 [project.optional-dependencies]
 dev = ["pytest>=8.0", "httpx>=0.27", "ruff>=0.6"]
 
+[project.scripts]
+service-desk-evidence = "service_desk.evidence:main"
+
 [tool.setuptools]
 py-modules = ["service_design"]
-packages = ["app", "human_agent"]
+packages = ["app", "human_agent", "service_desk"]
 
 [tool.ruff]
 line-length = 100
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra --strict-markers"
