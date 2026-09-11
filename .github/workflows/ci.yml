@@ -17,8 +17,18 @@ jobs:
           python-version: "3.12"
       - run: pip install -e ".[dev]"
       - run: ruff check .
+      - run: ruff format --check .
       - run: pytest -q
       - run: python service_design.py
+      - name: Generate executable service-desk evidence
+        run: |
+          mkdir -p evidence
+          service-desk-evidence > evidence/service-desk-run.json
+          python -m json.tool evidence/service-desk-run.json >/dev/null
+      - uses: actions/upload-artifact@v4
+        with:
+          name: agentic-service-desk-evidence
+          path: evidence/service-desk-run.json
       - name: Build installable wheel
         run: python -m pip wheel . --no-deps --wheel-dir /tmp/dist
       - name: Verify wheel outside source tree
@@ -26,12 +36,21 @@ jobs:
           python -m venv /tmp/wheelcheck
           cd /tmp
           /tmp/wheelcheck/bin/pip install /tmp/dist/*.whl
-          /tmp/wheelcheck/bin/python -c "from human_agent import CaseWorkflow, ReviewQueue; print(CaseWorkflow, ReviewQueue)"
+          /tmp/wheelcheck/bin/python -c "from human_agent import CaseWorkflow; from service_desk import ServiceDesk; print(CaseWorkflow, ServiceDesk)"
+          /tmp/wheelcheck/bin/service-desk-evidence >/tmp/wheel-evidence.json
+          /tmp/wheelcheck/bin/python -m json.tool /tmp/wheel-evidence.json >/dev/null
 
   container:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - run: docker build -t human-agent-service-design:ci .
-      - name: Verify packaged application import
-        run: docker run --rm human-agent-service-design:ci python -c "from app.api import app; print(app.title)"
+      - name: Verify live packaged application
+        run: |
+          docker run -d --name service-desk -p 8000:8000 human-agent-service-design:ci
+          for attempt in {1..20}; do
+            curl --fail --silent http://127.0.0.1:8000/health && exit 0
+            sleep 1
+          done
+          docker logs service-desk
+          exit 1

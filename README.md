@@ -1,161 +1,238 @@
-# Human–Agent Service Design Lab
+# Agentic Service Desk & Human–Agent Control Plane
 
-A portfolio lab for designing **human + AI agent collaboration** as a service, not merely as a chatbot screen.
+A Jira/ITSM-style service backend in which deterministic workflow owns business state and AI agents operate through durable jobs, typed tools, explicit risk policy and human approval.
 
-The central question is:
+This is not a collection of agents chatting with one another. It implements the system boundaries an enterprise workflow needs: projects, human-readable issue keys, immutable workflow definitions, role-authorized transitions, optimistic concurrency, idempotent requests, transactional outbox, leased agent jobs, bounded SQL access, approval-gated write tools, audit history and service metrics.
 
-> When should an AI agent act autonomously, when should it ask the customer for more information, and when should it hand control to a human reviewer?
+The original human–agent routing lab remains in `human_agent/`. The production-oriented service desk is in `service_desk/`; both are exercised by the same API, package and CI pipeline.
 
-This repository turns that question into explicit policies, measurable workflows, escalation rules, service blueprints and review tooling.
+## Design thesis
 
-## Why this project exists
-
-Many AI prototypes optimize only for model accuracy. Real services also have to optimize for:
-
-- customer completion rate;
-- reviewer workload;
-- time to decision;
-- automation rate;
-- false-positive / false-negative trade-offs;
-- evidence quality;
-- customer trust and comprehension;
-- override rate;
-- auditability;
-- operational fallback when the model or a downstream service is unavailable.
-
-The project therefore models the **whole interaction system** around an AI decision.
-
-## Reference journey
+AI confidence is not authority. The model may classify, summarize, retrieve evidence or recommend an action. The workflow engine decides whether that action is legal; the tool policy decides whether it is permitted; a human approves high-impact effects.
 
 ```mermaid
-flowchart LR
-    C[Customer] --> I[Submit information]
-    I --> E[Evidence collector]
-    E --> A[AI agent]
-    A --> P{Policy router}
-    P -- low risk + high confidence --> D[Automated decision]
-    P -- missing evidence --> Q[Ask customer]
-    Q --> E
-    P -- uncertainty / policy trigger --> H[Human reviewer]
-    H --> R{Reviewer action}
-    R -- approve --> D
-    R -- request evidence --> Q
-    R -- reject --> X[Decision + explanation]
-    D --> X
-    X --> O[Outcome telemetry]
-    O --> M[Service metrics]
-    M --> P
+flowchart TD
+    Client[Portal or integration] --> API[FastAPI REST boundary]
+    API --> Workflow[Deterministic workflow service]
+    Workflow --> DB[(PostgreSQL-shaped local store)]
+    DB --> Outbox[Transactional outbox]
+    Outbox --> Queue[Broker or event bus]
+    Queue --> Worker[Leased agent worker]
+    Worker --> Model[Model adapter]
+    Worker --> Tools[Typed tool registry]
+    Tools --> Policy{Risk policy}
+    Policy -->|read only| Execute[Execute]
+    Policy -->|write impact| Human[Human approval]
+    Human --> Execute
+    Execute --> Audit[(Audit and telemetry)]
 ```
 
-## Service blueprint
+## Implemented capabilities
 
-| Layer | Customer-facing | AI / system | Human operations | Measurement |
-|---|---|---|---|---|
-| Intake | Form / conversational intake | completeness checks | — | abandonment, completion time |
-| Evidence | upload / consent | extraction, validation, retrieval | exception handling | missing evidence rate |
-| Decision | status + explanation | scoring, policy routing | reviewer decision | automation, override, SLA |
-| Follow-up | request more info | next-best-action selection | escalation | rework loops |
-| Outcome | final decision | audit event | appeal / QA | accuracy, fairness, trust |
+### Jira-style issue domain
 
-## Core design principles
+- project keys and atomic sequential issue keys such as `OPS-1`;
+- versioned workflow definitions with explicit transition rules;
+- `open → triaged → in_progress → waiting_for_customer → resolved → closed` lifecycle;
+- requester, service-agent, admin and AI-worker roles;
+- resolution requirements and invalid-transition rejection;
+- optimistic issue versions that reject stale browser or agent writes;
+- public and internal comments with visibility policy;
+- assignment, labels, priority and complete actor-attributed audit history.
 
-### 1. Confidence is not authority
+### Durable agent orchestration
 
-A model confidence score does not automatically grant permission to act. The policy layer also considers impact, evidence completeness, explicit compliance rules and customer vulnerability.
+Agent work is represented as persisted jobs rather than an in-memory chain:
 
-### 2. Escalation is a product feature
+```mermaid
+stateDiagram-v2
+    [*] --> Queued
+    Queued --> Running: worker lease
+    Running --> Succeeded: validated output
+    Running --> Failed: model or tool error
+    Running --> WaitingForApproval: write tool request
+    WaitingForApproval --> Queued: human approval
+    Running --> Running: expired lease recovered
+    Queued --> Cancelled: operator cancellation
+```
 
-Human review is not treated as a failure mode. The system represents escalation reasons explicitly so review queues can be prioritized and the product team can learn where automation is weak.
+Every job records capability, input, output, error, attempt count, retry budget, lease owner and expiry. A crashed worker cannot strand the job permanently: an expired lease is claimable by another worker. Only the current lease owner may complete a running job.
 
-### 3. Explanations are audience-specific
+The runnable deterministic model is an offline test double, not a fake claim of LLM quality. A production OpenAI, Azure OpenAI or local model adapter can implement the same `AgentModel` protocol without changing workflow or persistence code.
 
-A reviewer needs evidence provenance and policy details. A customer needs a concise, actionable explanation. The system separates these views.
+### Governed tools
 
-### 4. Every decision is observable
+Tool risk is assigned by a server-side allowlist. The agent cannot label `transition_issue` as read-only to bypass approval.
 
-Each workflow produces an audit event containing the agent recommendation, policy route, human override (if any), latency and outcome.
+| Tool | Risk | Execution rule |
+|---|---|---|
+| `knowledge_search` | Read only | Execute under the active job lease |
+| `service_desk_sql` | Read only | SELECT/WITH only, table allowlist, row bound, read-only DB connection |
+| `assign_issue` | Reversible write | Human approval required |
+| `transition_issue` | High impact | Independent human approval required |
+
+High-impact calls enter `waiting_for_approval`; the requesting worker loses its lease. The same actor cannot request and approve the call. Approval requeues the durable job instead of executing an untracked side effect inside an HTTP request.
+
+### Safe SQL tool
+
+The SQL tool demonstrates the boundary interviewers usually mean when asking whether an agent can “go to SQL”:
+
+- accepts one `SELECT` or `WITH` statement;
+- rejects mutation, DDL, PRAGMA, attach and multi-statement input;
+- allows only configured read-model tables;
+- uses named parameters;
+- opens SQLite in `mode=ro` and enables `query_only`;
+- caps returned rows and reports truncation;
+- associates output with the originating durable job.
+
+This lightweight validator is appropriate for a local reference adapter. Production should parse SQL into an AST using the target dialect, query a read replica with a dedicated least-privilege identity, enforce execution timeout/cost limits and log query fingerprints.
+
+## Transaction boundaries
+
+Issue creation performs all of the following in one database transaction:
+
+1. lock the project sequence;
+2. validate or replay the idempotency key;
+3. allocate the human-readable issue key;
+4. persist the issue;
+5. persist the audit event;
+6. persist the outbox event.
+
+The broker is never called inside this transaction. A dispatcher leases committed outbox rows, publishes them and acknowledges each lease. Failure increments attempts and schedules a delayed retry. This prevents the classic state where the API commits `OPS-42` but crashes before the agent/notification event is sent.
+
+SQLite uses `BEGIN IMMEDIATE` for the runnable local adapter. PostgreSQL would use a row lock or atomic `UPDATE … RETURNING` for issue sequences and `FOR UPDATE SKIP LOCKED` for outbox/job claiming.
+
+## REST API
+
+Run locally:
+
+```bash
+pip install -e '.[dev]'
+uvicorn app.api:app --reload
+```
+
+Create a project:
+
+```bash
+curl -X POST http://localhost:8000/v1/projects \
+  -H 'content-type: application/json' \
+  -d '{"key":"OPS","name":"AI Operations"}'
+```
+
+Create an idempotent issue:
+
+```bash
+curl -X POST http://localhost:8000/v1/issues \
+  -H 'content-type: application/json' \
+  -H 'x-actor-id: requester-17' \
+  -H 'x-actor-role: requester' \
+  -H 'idempotency-key: mobile-request-8841' \
+  -d '{
+    "project_id":"PROJECT_ID",
+    "summary":"Production VPN unavailable",
+    "description":"Authentication fails for the engineering group.",
+    "priority":"high",
+    "labels":["vpn","production"]
+  }'
+```
+
+Transition with optimistic concurrency:
+
+```bash
+curl -X POST http://localhost:8000/v1/issues/ISSUE_ID/transitions \
+  -H 'content-type: application/json' \
+  -H 'x-actor-id: triage-worker-1' \
+  -H 'x-actor-role: ai_worker' \
+  -d '{"name":"triage","expected_version":1}'
+```
+
+Request durable AI work:
+
+```bash
+curl -X POST http://localhost:8000/v1/issues/ISSUE_ID/agent-jobs \
+  -H 'content-type: application/json' \
+  -H 'x-actor-id: agent-4' \
+  -H 'x-actor-role: agent' \
+  -d '{
+    "capability":"retrieve_knowledge",
+    "input_payload":{"query":"VPN authentication outage runbook"},
+    "max_attempts":3
+  }'
+```
+
+The API also exposes assignment, public/internal comments, filtered issue lists, audit streams and tool approval. Typed domain failures map to explicit `403`, `404`, `409` or `422` responses.
+
+## Human–agent routing lab
+
+The original service-design layer models customer evidence, agent recommendations and policy routing:
+
+- automate low-impact, high-confidence, well-evidenced cases;
+- ask the customer when evidence is incomplete;
+- queue uncertain/high-impact cases for a reviewer;
+- lease cases by priority and SLA deadline;
+- record reviewer overrides in a hash-chained audit ledger;
+- project automation, review, override and explanation metrics.
+
+`reviewer_cockpit.html` provides the corresponding reviewer UI prototype. It is deliberately separate from the service-desk backend so the human decision journey and backend control plane can be inspected independently.
+
+## Verification
+
+```bash
+ruff check .
+ruff format --check .
+pytest -q
+service-desk-evidence > service-desk-run.json
+docker build -t agentic-service-desk .
+```
+
+The regression suite covers:
+
+- idempotent create and conflicting replay;
+- workflow authorization and required resolution;
+- stale-version rejection;
+- issue-key allocation and label normalization;
+- public/internal comment visibility;
+- issue + audit + outbox atomicity;
+- outbox lease, retry and acknowledgement;
+- job lease ownership and expired-lease recovery;
+- deterministic triage and evidence retrieval;
+- SQL mutation, table and multi-statement rejection;
+- server-owned tool risk and independent approval;
+- REST lifecycle behavior;
+- the earlier human-review lifecycle and operational policy metrics.
+
+CI has three boundaries: lint/test/evidence, wheel installation outside the source tree, and a multi-stage non-root container with a live health probe. The JSON evidence artifact executes a real issue lifecycle, agent job, SQL read, audit stream and outbox drain; its invariant flags are computed from the run.
 
 ## Repository layout
 
 ```text
-human-agent-service-design/
-├── human_agent/
-│   ├── domain.py              # validated case, evidence and recommendation model
-│   ├── policy.py              # explicit automation and escalation policy
-│   ├── workflow.py            # versioned case lifecycle and review commands
-│   ├── review_queue.py        # SLA-aware priority queue and expiring leases
-│   ├── audit.py               # append-only hash-chained event ledger
-│   └── metrics.py             # operational outcome projections
-├── app/api.py                 # FastAPI policy and experiment boundary
-├── service_design.py          # compatibility facade for original imports
-├── reviewer_cockpit.html      # static portfolio prototype
-└── tests/                     # policy, API, lifecycle and concurrency invariants
+service_desk/
+├── agent.py       leased worker and replaceable model protocol
+├── api.py         Jira-style REST resources
+├── errors.py      typed service failures
+├── evidence.py    deterministic end-to-end artifact
+├── models.py      issue, workflow, job and tool contracts
+├── repository.py SQLite transactions, outbox and leases
+├── service.py     authorization and application policy
+└── tools.py       registry, bounded SQL and knowledge tools
+human_agent/
+├── audit.py       hash-chained decision ledger
+├── domain.py      evidence and recommendation model
+├── metrics.py     service outcome projections
+├── policy.py      automation/escalation rules
+├── review_queue.py
+└── workflow.py    human review lifecycle
+app/api.py         combined FastAPI application
+reviewer_cockpit.html
+tests/
 ```
 
-## Operational case lifecycle
+## Honest production boundary
 
-The package now models the state around a recommendation rather than stopping at a
-stateless routing response:
+The local implementation proves workflow and failure semantics on SQLite and uses an in-process worker driver. It does not claim distributed exactly-once delivery. A production deployment would use PostgreSQL, Kafka/RabbitMQ, Redis where caching is justified, object storage for attachments, OpenSearch for issue search, OIDC for identity, OpenTelemetry for traces, per-tenant encryption/access control and a workflow runtime such as Temporal when processes extend across long waits.
 
-```mermaid
-stateDiagram-v2
-    [*] --> Received
-    Received --> Decided: safe automation
-    Received --> AwaitingCustomer: missing evidence
-    Received --> QueuedForReview: policy escalation
-    QueuedForReview --> UnderReview: reviewer lease
-    UnderReview --> Decided: approve or reject
-```
+The core design survives those replacements because business state, asynchronous delivery, agent execution and tool authority already have separate contracts.
 
-Every mutation uses an expected case version, preventing a stale reviewer screen from
-silently overwriting a newer decision. Human-review items are ordered by policy priority
-and SLA deadline, leased to one reviewer for a bounded period, and returned to the queue
-when the lease expires. Completed decisions append a hash-chained audit event recording
-the actor, rationale, agent override and prior event hash.
+## Interview surface
 
-These are in-memory reference implementations with explicit production mappings. A real
-deployment would persist case versions transactionally, use a shared queue, and write the
-audit stream to durable append-only storage.
-
-## Example policies
-
-A case can be routed to a human when any of the following is true:
-
-- confidence is below a configurable threshold;
-- financial / customer impact is high;
-- evidence is incomplete or contradictory;
-- policy requires mandatory review;
-- the model and deterministic checks disagree;
-- a customer explicitly requests human review;
-- the same automated step fails repeatedly.
-
-## Metrics that matter
-
-This lab intentionally reports both AI and service metrics:
-
-- **automation rate** — cases completed without human intervention;
-- **review rate** — cases sent to human operations;
-- **override rate** — reviewer disagrees with agent recommendation;
-- **request-more-info rate** — cases needing an extra customer loop;
-- **decision latency** — end-to-end service time;
-- **review burden** — weighted queue load;
-- **high-impact auto-decision rate** — useful guardrail metric;
-- **explanation coverage** — decisions with an actionable customer explanation.
-
-The regression suite also protects operational invariants: stale-version rejection,
-reviewer lease ownership, expired-lease recovery, invalid state transitions, evidence
-provenance, override attribution and audit-chain verification.
-
-## Run
-
-```bash
-python service_design.py
-```
-
-The demo uses synthetic cases only. No customer, banking or employer data is included.
-
-## Portfolio signal
-
-This repository is intended to demonstrate the ability to connect:
-
-**Agentic AI · Service Design · Human-in-the-loop · Responsible Automation · Workflow Prototyping · Experiment Metrics · Auditability**
+`FastAPI` · `REST` · `SQL` · `workflow state machines` · `RBAC` · `optimistic concurrency` · `idempotency` · `transactional outbox` · `leases` · `agent orchestration` · `tool calling` · `human approval` · `RAG boundary` · `auditability` · `ITSM metrics`

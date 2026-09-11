@@ -1,8 +1,11 @@
 from __future__ import annotations
 
+import os
 from dataclasses import asdict
+from pathlib import Path
 
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
 from service_design import (
@@ -17,6 +20,10 @@ from service_design import (
     ServiceCase,
     summarize_outcomes,
 )
+from service_desk.api import create_service_desk_router
+from service_desk.errors import Conflict, Forbidden, InvalidTransition, NotFound, ServiceDeskError
+from service_desk.repository import SQLiteServiceDeskRepository
+from service_desk.service import ServiceDesk
 
 
 class EvidenceInput(BaseModel):
@@ -117,6 +124,30 @@ app = FastAPI(
         "It makes automation, customer follow-up and human escalation explicit and measurable."
     ),
 )
+
+service_desk_repository = SQLiteServiceDeskRepository(
+    Path(os.getenv("SERVICE_DESK_DATABASE_PATH", "service-desk.db"))
+)
+service_desk = ServiceDesk(service_desk_repository)
+service_desk.bootstrap()
+app.include_router(create_service_desk_router(service_desk))
+
+
+@app.exception_handler(ServiceDeskError)
+async def service_desk_error(_: Request, exc: ServiceDeskError) -> JSONResponse:
+    status = 409
+    if isinstance(exc, NotFound):
+        status = 404
+    elif isinstance(exc, Forbidden):
+        status = 403
+    elif isinstance(exc, InvalidTransition):
+        status = 422
+    elif isinstance(exc, Conflict):
+        status = 409
+    return JSONResponse(
+        status_code=status,
+        content={"error": type(exc).__name__, "detail": str(exc)},
+    )
 
 
 @app.get("/health")
