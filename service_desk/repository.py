@@ -14,10 +14,14 @@ from service_desk.models import (
     AgentJobState,
     Comment,
     Issue,
+    IssueLink,
+    IssueLinkType,
     IssuePriority,
     IssueStatus,
     OutboxEvent,
     Project,
+    SLAPolicy,
+    SLAState,
     ToolCall,
     ToolRisk,
     TransitionRule,
@@ -68,6 +72,48 @@ CREATE TABLE IF NOT EXISTS issues (
 );
 CREATE INDEX IF NOT EXISTS idx_issues_queue
     ON issues(project_id, status, priority, updated_at);
+
+CREATE TABLE IF NOT EXISTS issue_links (
+    link_id TEXT PRIMARY KEY,
+    source_issue_id TEXT NOT NULL,
+    target_issue_id TEXT NOT NULL,
+    link_type TEXT NOT NULL,
+    created_by TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    FOREIGN KEY(source_issue_id) REFERENCES issues(issue_id),
+    FOREIGN KEY(target_issue_id) REFERENCES issues(issue_id),
+    UNIQUE(source_issue_id, target_issue_id, link_type),
+    CHECK(source_issue_id <> target_issue_id)
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_issue_single_parent
+    ON issue_links(target_issue_id) WHERE link_type = 'parent_of';
+CREATE INDEX IF NOT EXISTS idx_issue_links_source
+    ON issue_links(source_issue_id, link_type, target_issue_id);
+CREATE INDEX IF NOT EXISTS idx_issue_links_target
+    ON issue_links(target_issue_id, link_type, source_issue_id);
+
+CREATE TABLE IF NOT EXISTS sla_policies (
+    project_id TEXT NOT NULL,
+    priority TEXT NOT NULL,
+    first_response_seconds INTEGER NOT NULL CHECK(first_response_seconds >= 60),
+    resolution_seconds INTEGER NOT NULL CHECK(resolution_seconds >= first_response_seconds),
+    PRIMARY KEY(project_id, priority),
+    FOREIGN KEY(project_id) REFERENCES projects(project_id)
+);
+
+CREATE TABLE IF NOT EXISTS sla_instances (
+    issue_id TEXT PRIMARY KEY,
+    first_response_due_at TEXT NOT NULL,
+    resolution_due_at TEXT NOT NULL,
+    paused_at TEXT,
+    total_paused_seconds INTEGER NOT NULL DEFAULT 0,
+    first_responded_at TEXT,
+    resolved_at TEXT,
+    updated_at TEXT NOT NULL,
+    FOREIGN KEY(issue_id) REFERENCES issues(issue_id)
+);
+CREATE INDEX IF NOT EXISTS idx_sla_resolution_queue
+    ON sla_instances(resolved_at, resolution_due_at);
 
 CREATE TABLE IF NOT EXISTS comments (
     comment_id TEXT PRIMARY KEY,
@@ -350,6 +396,27 @@ class SQLiteServiceDeskRepository:
                     self.time(now),
                 ),
             )
+            policy = connection.execute(
+                """
+                SELECT first_response_seconds, resolution_seconds
+                FROM sla_policies WHERE project_id = ? AND priority = ?
+                """,
+                (project_id, priority.value),
+            ).fetchone()
+            if policy:
+                connection.execute(
+                    """
+                    INSERT INTO sla_instances(
+                        issue_id, first_response_due_at, resolution_due_at, updated_at
+                    ) VALUES (?, ?, ?, ?)
+                    """,
+                    (
+                        issue_id,
+                        self.time(now + timedelta(seconds=policy["first_response_seconds"])),
+                        self.time(now + timedelta(seconds=policy["resolution_seconds"])),
+                        self.time(now),
+                    ),
+                )
             connection.execute(
                 "INSERT INTO idempotency_keys VALUES (?, ?, ?, ?, ?)",
                 (scope, idempotency_key, request_hash, issue_id, self.time(now)),
@@ -433,6 +500,7 @@ class SQLiteServiceDeskRepository:
                 payload,
             )
             self._outbox(connection, outbox_event_id, issue_id, "issue.transitioned", payload)
+            self._update_sla_for_transition(connection, current.status, target, issue_id, now)
             updated = self._get_issue(connection, issue_id)
             connection.commit()
             return updated
@@ -471,6 +539,7 @@ class SQLiteServiceDeskRepository:
         body: str,
         internal: bool,
         event_id: str,
+        mark_first_response: bool = False,
     ) -> Comment:
         now = self.now()
         with self._lock, self.connect() as connection:
@@ -490,6 +559,14 @@ class SQLiteServiceDeskRepository:
                 payload,
             )
             self._outbox(connection, event_id, issue_id, "issue.comment_added", payload)
+            if mark_first_response:
+                connection.execute(
+                    """
+                    UPDATE sla_instances SET first_responded_at = COALESCE(first_responded_at, ?),
+                        updated_at = ? WHERE issue_id = ?
+                    """,
+                    (self.time(now), self.time(now), issue_id),
+                )
             connection.commit()
         return Comment(comment_id, issue_id, author_id, body, internal, now)
 
@@ -767,6 +844,178 @@ class SQLiteServiceDeskRepository:
             ).fetchone()
         return self._tool_call(updated)
 
+    def configure_sla_policy(self, policy: SLAPolicy) -> SLAPolicy:
+        self.get_project(policy.project_id)
+        with self._lock, self.connect() as connection:
+            connection.execute(
+                """
+                INSERT INTO sla_policies(
+                    project_id, priority, first_response_seconds, resolution_seconds
+                ) VALUES (?, ?, ?, ?)
+                ON CONFLICT(project_id, priority) DO UPDATE SET
+                    first_response_seconds = excluded.first_response_seconds,
+                    resolution_seconds = excluded.resolution_seconds
+                """,
+                (
+                    policy.project_id,
+                    policy.priority.value,
+                    policy.first_response_seconds,
+                    policy.resolution_seconds,
+                ),
+            )
+        return policy
+
+    def get_sla_state(self, issue_id: str) -> SLAState:
+        now = self.now()
+        with self.connect() as connection:
+            self._get_issue(connection, issue_id)
+            row = connection.execute(
+                "SELECT * FROM sla_instances WHERE issue_id = ?", (issue_id,)
+            ).fetchone()
+        if not row:
+            raise NotFound(f"issue {issue_id!r} has no matching SLA policy")
+        first_due = datetime.fromisoformat(row["first_response_due_at"])
+        resolution_due = datetime.fromisoformat(row["resolution_due_at"])
+        paused_at = datetime.fromisoformat(row["paused_at"]) if row["paused_at"] else None
+        first_response = (
+            datetime.fromisoformat(row["first_responded_at"]) if row["first_responded_at"] else None
+        )
+        resolved = datetime.fromisoformat(row["resolved_at"]) if row["resolved_at"] else None
+        reference = paused_at or now
+        first_observed = first_response or reference
+        resolution_observed = resolved or reference
+        return SLAState(
+            issue_id=issue_id,
+            first_response_due_at=first_due,
+            resolution_due_at=resolution_due,
+            paused_at=paused_at,
+            total_paused_seconds=int(row["total_paused_seconds"]),
+            first_responded_at=first_response,
+            resolved_at=resolved,
+            first_response_breached=first_observed > first_due,
+            resolution_breached=resolution_observed > resolution_due,
+            first_response_remaining_seconds=max(
+                0, int((first_due - first_observed).total_seconds())
+            ),
+            resolution_remaining_seconds=max(
+                0, int((resolution_due - resolution_observed).total_seconds())
+            ),
+        )
+
+    def create_issue_link(self, link: IssueLink) -> IssueLink:
+        with self._lock, self.connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            source = self._get_issue(connection, link.source_issue_id)
+            target = self._get_issue(connection, link.target_issue_id)
+            if source.project_id != target.project_id and link.link_type is IssueLinkType.PARENT_OF:
+                raise Conflict("parent and child issues must belong to the same project")
+            if link.source_issue_id == link.target_issue_id:
+                raise Conflict("an issue cannot link to itself")
+            if link.link_type is IssueLinkType.PARENT_OF:
+                cycle = connection.execute(
+                    """
+                    WITH RECURSIVE descendants(issue_id) AS (
+                        SELECT target_issue_id FROM issue_links
+                        WHERE source_issue_id = ? AND link_type = 'parent_of'
+                        UNION ALL
+                        SELECT links.target_issue_id FROM issue_links AS links
+                        JOIN descendants ON links.source_issue_id = descendants.issue_id
+                        WHERE links.link_type = 'parent_of'
+                    )
+                    SELECT 1 FROM descendants WHERE issue_id = ? LIMIT 1
+                    """,
+                    (link.target_issue_id, link.source_issue_id),
+                ).fetchone()
+                if cycle:
+                    raise Conflict("parent link would create an issue hierarchy cycle")
+            try:
+                connection.execute(
+                    """
+                    INSERT INTO issue_links(
+                        link_id, source_issue_id, target_issue_id, link_type, created_by, created_at
+                    ) VALUES (?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        link.link_id,
+                        link.source_issue_id,
+                        link.target_issue_id,
+                        link.link_type.value,
+                        link.created_by,
+                        self.time(link.created_at),
+                    ),
+                )
+            except sqlite3.IntegrityError as exc:
+                raise Conflict("issue link already exists or child already has a parent") from exc
+            self._audit(
+                connection,
+                link.link_id + "-audit",
+                link.target_issue_id,
+                "issue_link_created",
+                link.created_by,
+                {
+                    "source_issue_id": link.source_issue_id,
+                    "link_type": link.link_type.value,
+                },
+            )
+            self._outbox(
+                connection,
+                link.link_id + "-outbox",
+                link.target_issue_id,
+                "issue.link_created",
+                {
+                    "source_issue_id": link.source_issue_id,
+                    "target_issue_id": link.target_issue_id,
+                    "link_type": link.link_type.value,
+                },
+            )
+            connection.commit()
+        return link
+
+    def list_issue_links(self, issue_id: str) -> list[IssueLink]:
+        with self.connect() as connection:
+            self._get_issue(connection, issue_id)
+            rows = connection.execute(
+                """
+                SELECT * FROM issue_links
+                WHERE source_issue_id = ? OR target_issue_id = ?
+                ORDER BY created_at, link_id
+                """,
+                (issue_id, issue_id),
+            ).fetchall()
+        return [
+            IssueLink(
+                link_id=row["link_id"],
+                source_issue_id=row["source_issue_id"],
+                target_issue_id=row["target_issue_id"],
+                link_type=IssueLinkType(row["link_type"]),
+                created_by=row["created_by"],
+                created_at=datetime.fromisoformat(row["created_at"]),
+            )
+            for row in rows
+        ]
+
+    def issue_descendants(self, issue_id: str) -> list[Issue]:
+        with self.connect() as connection:
+            self._get_issue(connection, issue_id)
+            rows = connection.execute(
+                """
+                WITH RECURSIVE descendants(issue_id, depth) AS (
+                    SELECT target_issue_id, 1 FROM issue_links
+                    WHERE source_issue_id = ? AND link_type = 'parent_of'
+                    UNION ALL
+                    SELECT links.target_issue_id, descendants.depth + 1
+                    FROM issue_links AS links
+                    JOIN descendants ON links.source_issue_id = descendants.issue_id
+                    WHERE links.link_type = 'parent_of'
+                )
+                SELECT issues.* FROM descendants
+                JOIN issues ON issues.issue_id = descendants.issue_id
+                ORDER BY descendants.depth, issues.issue_sequence
+                """,
+                (issue_id,),
+            ).fetchall()
+        return [self._issue(row) for row in rows]
+
     def audit_stream(self, issue_id: str) -> list[dict[str, Any]]:
         with self.connect() as connection:
             rows = connection.execute(
@@ -783,6 +1032,57 @@ class SQLiteServiceDeskRepository:
             }
             for row in rows
         ]
+
+    def _update_sla_for_transition(
+        self,
+        connection: sqlite3.Connection,
+        source: IssueStatus,
+        target: IssueStatus,
+        issue_id: str,
+        now: datetime,
+    ) -> None:
+        row = connection.execute(
+            "SELECT * FROM sla_instances WHERE issue_id = ?", (issue_id,)
+        ).fetchone()
+        if not row:
+            return
+        if target is IssueStatus.WAITING_FOR_CUSTOMER and row["paused_at"] is None:
+            connection.execute(
+                "UPDATE sla_instances SET paused_at = ?, updated_at = ? WHERE issue_id = ?",
+                (self.time(now), self.time(now), issue_id),
+            )
+            return
+        if source is IssueStatus.WAITING_FOR_CUSTOMER and row["paused_at"]:
+            paused_at = datetime.fromisoformat(row["paused_at"])
+            pause_seconds = max(0, int((now - paused_at).total_seconds()))
+            first_due = datetime.fromisoformat(row["first_response_due_at"]) + timedelta(
+                seconds=pause_seconds
+            )
+            resolution_due = datetime.fromisoformat(row["resolution_due_at"]) + timedelta(
+                seconds=pause_seconds
+            )
+            connection.execute(
+                """
+                UPDATE sla_instances SET first_response_due_at = ?, resolution_due_at = ?,
+                    paused_at = NULL, total_paused_seconds = total_paused_seconds + ?,
+                    updated_at = ? WHERE issue_id = ?
+                """,
+                (
+                    self.time(first_due),
+                    self.time(resolution_due),
+                    pause_seconds,
+                    self.time(now),
+                    issue_id,
+                ),
+            )
+        if target in {IssueStatus.RESOLVED, IssueStatus.CLOSED}:
+            connection.execute(
+                """
+                UPDATE sla_instances SET resolved_at = COALESCE(resolved_at, ?),
+                    updated_at = ? WHERE issue_id = ?
+                """,
+                (self.time(now), self.time(now), issue_id),
+            )
 
     def _get_issue(self, connection: sqlite3.Connection, issue_id: str) -> Issue:
         row = connection.execute("SELECT * FROM issues WHERE issue_id = ?", (issue_id,)).fetchone()

@@ -44,6 +44,12 @@ class ToolRisk(StrEnum):
     HIGH_IMPACT = "high_impact"
 
 
+class IssueLinkType(StrEnum):
+    PARENT_OF = "parent_of"
+    BLOCKS = "blocks"
+    RELATES_TO = "relates_to"
+
+
 @dataclass(frozen=True, slots=True)
 class Actor:
     actor_id: str
@@ -212,3 +218,42 @@ class ToolCall:
     requested_by: str
     approved_by: str | None
     result: dict[str, Any] | None
+
+
+@dataclass(frozen=True, slots=True)
+class IssueLink:
+    link_id: str
+    source_issue_id: str
+    target_issue_id: str
+    link_type: IssueLinkType
+    created_by: str
+    created_at: datetime
+
+
+@dataclass(frozen=True, slots=True)
+class SLAPolicy:
+    project_id: str
+    priority: IssuePriority
+    first_response_seconds: int
+    resolution_seconds: int
+
+    def __post_init__(self) -> None:
+        if self.first_response_seconds < 60:
+            raise ValueError("first-response target must be at least 60 seconds")
+        if self.resolution_seconds < self.first_response_seconds:
+            raise ValueError("resolution target cannot be shorter than first-response target")
+
+
+@dataclass(frozen=True, slots=True)
+class SLAState:
+    issue_id: str
+    first_response_due_at: datetime
+    resolution_due_at: datetime
+    paused_at: datetime | None
+    total_paused_seconds: int
+    first_responded_at: datetime | None
+    resolved_at: datetime | None
+    first_response_breached: bool
+    resolution_breached: bool
+    first_response_remaining_seconds: int
+    resolution_remaining_seconds: int
