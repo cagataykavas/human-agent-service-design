@@ -6,7 +6,7 @@ from typing import Annotated, Any
 from fastapi import APIRouter, Header, Query
 from pydantic import BaseModel, Field
 
-from service_desk.models import Actor, ActorRole, IssuePriority, IssueStatus
+from service_desk.models import Actor, ActorRole, IssueLinkType, IssuePriority, IssueStatus
 from service_desk.service import ServiceDesk
 
 ActorIdHeader = Annotated[str, Header(min_length=1)]
@@ -47,6 +47,16 @@ class AgentJobRequest(BaseModel):
 class CommentRequest(BaseModel):
     body: str = Field(min_length=1, max_length=20_000)
     internal: bool = False
+
+
+class IssueLinkRequest(BaseModel):
+    target_issue_id: str = Field(min_length=1)
+    link_type: IssueLinkType
+
+
+class SLAPolicyRequest(BaseModel):
+    first_response_seconds: int = Field(ge=60, le=31_536_000)
+    resolution_seconds: int = Field(ge=60, le=31_536_000)
 
 
 def create_service_desk_router(desk: ServiceDesk) -> APIRouter:
@@ -172,6 +182,58 @@ def create_service_desk_router(desk: ServiceDesk) -> APIRouter:
     @router.get("/issues/{issue_id}/audit")
     def audit_stream(issue_id: str) -> list[dict[str, Any]]:
         return desk.repository.audit_stream(issue_id)
+
+    @router.put("/projects/{project_id}/sla/{priority}")
+    def configure_sla(
+        project_id: str,
+        priority: IssuePriority,
+        payload: SLAPolicyRequest,
+        x_actor_id: ActorIdHeader,
+        x_actor_role: ActorRoleHeader,
+    ) -> dict[str, Any]:
+        return asdict(
+            desk.configure_sla(
+                project_id=project_id,
+                priority=priority,
+                first_response_seconds=payload.first_response_seconds,
+                resolution_seconds=payload.resolution_seconds,
+                actor=Actor(x_actor_id, x_actor_role),
+            )
+        )
+
+    @router.get("/issues/{issue_id}/sla")
+    def get_sla(issue_id: str) -> dict[str, Any]:
+        return asdict(desk.sla_state(issue_id))
+
+    @router.post("/issues/{source_issue_id}/links", status_code=201)
+    def create_issue_link(
+        source_issue_id: str,
+        payload: IssueLinkRequest,
+        x_actor_id: ActorIdHeader,
+        x_actor_role: ActorRoleHeader,
+    ) -> dict[str, Any]:
+        link = desk.link_issues(
+            source_issue_id=source_issue_id,
+            target_issue_id=payload.target_issue_id,
+            link_type=payload.link_type,
+            actor=Actor(x_actor_id, x_actor_role),
+        )
+        result = asdict(link)
+        result["link_type"] = link.link_type.value
+        return result
+
+    @router.get("/issues/{issue_id}/links")
+    def list_issue_links(issue_id: str) -> list[dict[str, Any]]:
+        values = []
+        for link in desk.repository.list_issue_links(issue_id):
+            item = asdict(link)
+            item["link_type"] = link.link_type.value
+            values.append(item)
+        return values
+
+    @router.get("/issues/{issue_id}/descendants")
+    def list_descendants(issue_id: str) -> list[dict[str, Any]]:
+        return [_issue(issue) for issue in desk.repository.issue_descendants(issue_id)]
 
     @router.post("/tool-calls/{call_id}/approval")
     def approve_tool_call(

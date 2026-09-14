@@ -15,8 +15,12 @@ from service_desk.models import (
     AgentJobState,
     Comment,
     Issue,
+    IssueLink,
+    IssueLinkType,
     IssuePriority,
     Project,
+    SLAPolicy,
+    SLAState,
     ToolCall,
     ToolRisk,
     WorkflowDefinition,
@@ -184,6 +188,52 @@ class ServiceDesk:
             body=body.strip(),
             internal=internal,
             event_id=str(uuid4()),
+            mark_first_response=not internal and actor.role in {ActorRole.AGENT, ActorRole.ADMIN},
+        )
+
+    def configure_sla(
+        self,
+        *,
+        project_id: str,
+        priority: IssuePriority,
+        first_response_seconds: int,
+        resolution_seconds: int,
+        actor: Actor,
+    ) -> SLAPolicy:
+        if actor.role is not ActorRole.ADMIN:
+            raise Forbidden("only admins can configure project SLA policy")
+        return self.repository.configure_sla_policy(
+            SLAPolicy(
+                project_id=project_id,
+                priority=priority,
+                first_response_seconds=first_response_seconds,
+                resolution_seconds=resolution_seconds,
+            )
+        )
+
+    def sla_state(self, issue_id: str) -> SLAState:
+        return self.repository.get_sla_state(issue_id)
+
+    def link_issues(
+        self,
+        *,
+        source_issue_id: str,
+        target_issue_id: str,
+        link_type: IssueLinkType,
+        actor: Actor,
+        link_id: str | None = None,
+    ) -> IssueLink:
+        if actor.role not in {ActorRole.AGENT, ActorRole.ADMIN}:
+            raise Forbidden("only agents and admins can link issues")
+        return self.repository.create_issue_link(
+            IssueLink(
+                link_id=link_id or str(uuid4()),
+                source_issue_id=source_issue_id,
+                target_issue_id=target_issue_id,
+                link_type=link_type,
+                created_by=actor.actor_id,
+                created_at=self.repository.now(),
+            )
         )
 
     def request_agent_job(

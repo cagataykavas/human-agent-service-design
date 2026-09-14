@@ -39,6 +39,23 @@ flowchart TD
 - optimistic issue versions that reject stale browser or agent writes;
 - public and internal comments with visibility policy;
 - assignment, labels, priority and complete actor-attributed audit history.
+- same-project parent/child hierarchy with single-parent and cycle prevention; typed blocks/relates links;
+- per-project, per-priority first-response and resolution SLAs, with customer-wait pauses.
+
+### Kafka event path
+
+Issue writes, audit and outbox insertion share one SQLite transaction. `service-desk-stream publish` leases outbox rows, publishes keyed by issue ID to preserve per-issue partition order, waits for broker acknowledgement (`acks=all` and idempotent Kafka producer), then acknowledges the outbox row. Broker failure schedules a retry. `service-desk-stream consume` applies events to an inbox-backed issue-event projection, then commits the Kafka offset synchronously. The event envelope has a schema version, stable event ID, aggregate ID, type, payload and timestamp.
+
+```bash
+pip install -e '.[kafka]'
+docker compose -f compose.kafka.yml up -d --wait
+service-desk-stream publish --database service-desk.db --once
+service-desk-stream consume --database service-desk.db --once
+```
+
+Create an issue through the REST API before publishing; keep publisher and consumer running without `--once` for continuous processing. The example broker binds to localhost only. `--once` on the consumer polls once and may return before a message arrives; use continuous mode for a demo. The projection counts event types per issue; inspect `issue_event_counts` with SQLite. A fresh consumer group begins at the earliest offset.
+
+Delivery is **at least once**, not exactly once: a crash after Kafka acknowledgement but before outbox acknowledgement can republish an event. The inbox primary key makes projection effects idempotent, and its insert and counter increment share a database transaction. A malformed event prevents offset commit and requires an operational poison-message policy/DLQ in a real deployment. Schema migration, authentication/TLS, broker provisioning and multi-tenant isolation remain deployment work. Docker and a live broker are required for a full integration run; unit tests cover the acknowledgement/retry/replay/offset contract without pretending to exercise a broker.
 
 ### Durable agent orchestration
 
@@ -194,6 +211,8 @@ The regression suite covers:
 - public/internal comment visibility;
 - issue + audit + outbox atomicity;
 - outbox lease, retry and acknowledgement;
+- publish failure, post-publish crash/replay, idempotent inbox and offset ordering;
+- hierarchy cycles, second-parent rejection, SLA pause/resume and breach observations;
 - job lease ownership and expired-lease recovery;
 - deterministic triage and evidence retrieval;
 - SQL mutation, table and multi-statement rejection;
@@ -214,6 +233,8 @@ service_desk/
 ├── models.py      issue, workflow, job and tool contracts
 ├── repository.py SQLite transactions, outbox and leases
 ├── service.py     authorization and application policy
+├── streaming.py   Kafka publisher, outbox dispatcher and idempotent projection
+├── stream_worker.py  publisher/consumer CLI
 └── tools.py       registry, bounded SQL and knowledge tools
 human_agent/
 ├── audit.py       hash-chained decision ledger
@@ -229,10 +250,10 @@ tests/
 
 ## Honest production boundary
 
-The local implementation proves workflow and failure semantics on SQLite and uses an in-process worker driver. It does not claim distributed exactly-once delivery. A production deployment would use PostgreSQL, Kafka/RabbitMQ, Redis where caching is justified, object storage for attachments, OpenSearch for issue search, OIDC for identity, OpenTelemetry for traces, per-tenant encryption/access control and a workflow runtime such as Temporal when processes extend across long waits.
+The local implementation proves workflow and failure semantics on SQLite and has an optional Kafka-compatible broker adapter; CI does not start a real Kafka broker. It does not claim distributed exactly-once delivery. A production deployment would use PostgreSQL, Redis where caching is justified, object storage for attachments, OpenSearch for issue search, OIDC for identity, OpenTelemetry for traces, per-tenant encryption/access control and a workflow runtime such as Temporal when processes extend across long waits.
 
 The core design survives those replacements because business state, asynchronous delivery, agent execution and tool authority already have separate contracts.
 
 ## Interview surface
 
-`FastAPI` · `REST` · `SQL` · `workflow state machines` · `RBAC` · `optimistic concurrency` · `idempotency` · `transactional outbox` · `leases` · `agent orchestration` · `tool calling` · `human approval` · `RAG boundary` · `auditability` · `ITSM metrics`
+`FastAPI` · `REST` · `SQL` · `Kafka` · `outbox/inbox` · `at-least-once delivery` · `SLA` · `issue hierarchy` · `workflow state machines` · `RBAC` · `optimistic concurrency` · `idempotency` · `leases` · `agent orchestration` · `tool calling` · `human approval` · `auditability`
