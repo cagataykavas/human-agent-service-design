@@ -21,6 +21,13 @@ def generate_evidence() -> dict[str, Any]:
         project = desk.create_project(key="OPS", name="AI Operations", project_id="project-1")
         requester = Actor("requester-17", ActorRole.REQUESTER)
         human_agent = Actor("agent-4", ActorRole.AGENT)
+        desk.configure_sla(
+            project_id=project.project_id,
+            priority=IssuePriority.HIGH,
+            first_response_seconds=900,
+            resolution_seconds=14_400,
+            actor=Actor("service-admin", ActorRole.ADMIN),
+        )
         issue = desk.create_issue(
             project_id=project.project_id,
             summary="Production VPN unavailable",
@@ -84,6 +91,11 @@ def generate_evidence() -> dict[str, Any]:
         )
         desk.comment(
             issue.issue_id,
+            "We are investigating the identity provider path.",
+            actor=human_agent,
+        )
+        desk.comment(
+            issue.issue_id,
             "Identity provider health check requested.",
             actor=human_agent,
             internal=True,
@@ -94,6 +106,11 @@ def generate_evidence() -> dict[str, Any]:
             actor=human_agent,
             expected_version=started.version,
             resolution="Identity provider session keys rotated; requester confirmed access.",
+        )
+        sla = desk.sla_state(issue.issue_id)
+        search = repository.search_issues(
+            project.project_id,
+            'priority = high AND label = vpn AND text ~ "authentication"',
         )
         sql_result = ReadOnlySQLTool(repository.path).execute(
             {
@@ -122,6 +139,17 @@ def generate_evidence() -> dict[str, Any]:
             },
             "sql_read_model": sql_result,
             "outbox": {"published_count": len(outbox)},
+            "search": {
+                "result_keys": [item.issue_key for item in search.items],
+                "next_cursor": search.next_cursor,
+            },
+            "sla": {
+                "first_response_breached": sla.first_response_breached,
+                "resolution_breached": sla.resolution_breached,
+                "first_responded_at": sla.first_responded_at.isoformat()
+                if sla.first_responded_at
+                else None,
+            },
             "audit_event_types": [event["event_type"] for event in audit],
             "invariants": {
                 "idempotent_create_replayed": replay.issue_id == issue.issue_id,
@@ -131,6 +159,9 @@ def generate_evidence() -> dict[str, Any]:
                 "outbox_drained": repository.pending_outbox("publisher-2", 10) == [],
                 "sql_tool_is_bounded": sql_result["row_count"] == 1,
                 "audit_attributed": all(event["actor_id"] for event in audit),
+                "safe_search_found_issue": [item.issue_id for item in search.items]
+                == [issue.issue_id],
+                "sla_first_response_recorded": sla.first_responded_at is not None,
             },
         }
 

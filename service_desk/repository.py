@@ -17,6 +17,7 @@ from service_desk.models import (
     IssueLink,
     IssueLinkType,
     IssuePriority,
+    IssueSearchPage,
     IssueStatus,
     OutboxEvent,
     Project,
@@ -27,6 +28,7 @@ from service_desk.models import (
     TransitionRule,
     WorkflowDefinition,
 )
+from service_desk.search import IssueCursor, compile_issue_query
 
 SCHEMA = """
 PRAGMA foreign_keys = ON;
@@ -456,6 +458,56 @@ class SQLiteServiceDeskRepository:
         with self.connect() as connection:
             rows = connection.execute(query, params).fetchall()
         return [self._issue(row) for row in rows]
+
+    def search_issues(
+        self,
+        project_id: str,
+        expression: str | None,
+        *,
+        cursor: str | None = None,
+        limit: int = 50,
+        risk_horizon_seconds: int = 1800,
+    ) -> IssueSearchPage:
+        """Compile an allowlisted query and paginate on a stable compound sort key."""
+        self.get_project(project_id)
+        if not 1 <= limit <= 100:
+            raise ValueError("search limit must be in [1, 100]")
+        if not 60 <= risk_horizon_seconds <= 86_400:
+            raise ValueError("risk horizon must be in [60, 86400] seconds")
+        compiled = compile_issue_query(expression)
+        now = self.now()
+        risk_horizon = now + timedelta(seconds=risk_horizon_seconds)
+        parameters: list[Any] = [project_id]
+        query = (
+            "SELECT issues.* FROM issues "
+            "LEFT JOIN sla_instances AS sla ON sla.issue_id = issues.issue_id "
+            "WHERE issues.project_id = ?"
+        )
+        if compiled.where_sql:
+            query += " AND " + compiled.where_sql
+            parameters.extend(
+                self.time(now)
+                if value == "__NOW__"
+                else self.time(risk_horizon)
+                if value == "__RISK_HORIZON__"
+                else value
+                for value in compiled.parameters
+            )
+        if cursor:
+            position = IssueCursor.decode(cursor)
+            query += " AND (issues.updated_at < ? OR (issues.updated_at = ? AND issues.issue_sequence < ?))"
+            parameters.extend((position.updated_at, position.updated_at, position.sequence))
+        query += " ORDER BY issues.updated_at DESC, issues.issue_sequence DESC LIMIT ?"
+        parameters.append(limit + 1)
+        with self.connect() as connection:
+            rows = connection.execute(query, parameters).fetchall()
+        has_more = len(rows) > limit
+        selected = rows[:limit]
+        next_cursor = None
+        if has_more and selected:
+            last = selected[-1]
+            next_cursor = IssueCursor(last["updated_at"], last["issue_sequence"]).encode()
+        return IssueSearchPage(tuple(self._issue(row) for row in selected), next_cursor)
 
     def transition_issue(
         self,

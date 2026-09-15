@@ -20,3 +20,7 @@ class InvalidTransition(ServiceDeskError):
 
 class ToolPolicyViolation(ServiceDeskError):
     pass
+
+
+class InvalidIssueQuery(ServiceDeskError, ValueError):
+    pass

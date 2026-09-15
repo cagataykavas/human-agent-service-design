@@ -71,3 +71,36 @@ def test_api_exposes_issue_lifecycle_and_agent_job(tmp_path: Path) -> None:
         "issue_created",
         "issue_transitioned",
     ]
+
+
+def test_api_exposes_safe_filtered_issue_search(tmp_path: Path) -> None:
+    client = client_for(tmp_path)
+    project_id = client.post("/v1/projects", json={"key": "OPS", "name": "Operations"}).json()[
+        "project_id"
+    ]
+    for number, summary in enumerate(("VPN authentication fails", "Laptop replacement"), start=1):
+        response = client.post(
+            "/v1/issues",
+            headers={
+                "x-actor-id": "user-1",
+                "x-actor-role": "requester",
+                "idempotency-key": f"request-{number}",
+            },
+            json={
+                "project_id": project_id,
+                "summary": summary,
+                "priority": "high" if number == 1 else "low",
+                "labels": ["vpn"] if number == 1 else ["hardware"],
+            },
+        )
+        assert response.status_code == 201
+    search = client.get(
+        f"/v1/projects/{project_id}/search",
+        params={"q": 'priority = high AND text ~ "authentication"', "limit": 1},
+    )
+    assert search.status_code == 200
+    assert [item["issue_key"] for item in search.json()["items"]] == ["OPS-1"]
+    rejected = client.get(
+        f"/v1/projects/{project_id}/search", params={"q": "status = open OR 1 = 1"}
+    )
+    assert rejected.status_code == 409

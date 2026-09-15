@@ -257,3 +257,9 @@ class SLAState:
     resolution_breached: bool
     first_response_remaining_seconds: int
     resolution_remaining_seconds: int
+
+
+@dataclass(frozen=True, slots=True)
+class IssueSearchPage:
+    items: tuple[Issue, ...]
+    next_cursor: str | None

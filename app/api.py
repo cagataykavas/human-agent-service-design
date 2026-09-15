@@ -21,7 +21,14 @@ from service_design import (
     summarize_outcomes,
 )
 from service_desk.api import create_service_desk_router
-from service_desk.errors import Conflict, Forbidden, InvalidTransition, NotFound, ServiceDeskError
+from service_desk.errors import (
+    Conflict,
+    Forbidden,
+    InvalidIssueQuery,
+    InvalidTransition,
+    NotFound,
+    ServiceDeskError,
+)
 from service_desk.repository import SQLiteServiceDeskRepository
 from service_desk.service import ServiceDesk
 
@@ -140,7 +147,7 @@ async def service_desk_error(_: Request, exc: ServiceDeskError) -> JSONResponse:
         status = 404
     elif isinstance(exc, Forbidden):
         status = 403
-    elif isinstance(exc, InvalidTransition):
+    elif isinstance(exc, (InvalidTransition, InvalidIssueQuery)):
         status = 422
     elif isinstance(exc, Conflict):
         status = 409
