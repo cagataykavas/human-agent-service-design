@@ -99,6 +99,23 @@ def create_service_desk_router(desk: ServiceDesk) -> APIRouter:
             for issue in desk.repository.list_issues(project_id, status=status, limit=limit)
         ]
 
+    @router.get("/projects/{project_id}/search")
+    def search_issues(
+        project_id: str,
+        q: str | None = Query(default=None, max_length=1000),
+        cursor: str | None = Query(default=None, max_length=500),
+        limit: int = Query(default=50, ge=1, le=100),
+        risk_horizon_seconds: int = Query(default=1800, ge=60, le=86_400),
+    ) -> dict[str, Any]:
+        page = desk.repository.search_issues(
+            project_id,
+            q,
+            cursor=cursor,
+            limit=limit,
+            risk_horizon_seconds=risk_horizon_seconds,
+        )
+        return {"items": [_issue(issue) for issue in page.items], "next_cursor": page.next_cursor}
+
     @router.post("/issues/{issue_id}/transitions")
     def transition_issue(
         issue_id: str,

@@ -41,6 +41,18 @@ flowchart TD
 - assignment, labels, priority and complete actor-attributed audit history.
 - same-project parent/child hierarchy with single-parent and cycle prevention; typed blocks/relates links;
 - per-project, per-priority first-response and resolution SLAs, with customer-wait pauses.
+- parameterized JQL-like search with allowlisted fields and stable keyset pagination.
+
+### Safe issue search
+
+`GET /v1/projects/{project_id}/search` accepts a deliberately bounded query language. Supported fields are `status`, `priority`, `assignee`, `reporter`, `label`, `text` and `sla`; clauses may be joined with `AND`. Status and priority support `IN`, text uses `~`, and SLA supports `breached`, `at_risk`, `on_track` or `none`.
+
+```text
+priority IN (high,critical) AND label = production AND sla = at_risk
+status != closed AND assignee = agent-4 AND text ~ "authentication"
+```
+
+The parser never places user input in SQL syntax: it maps allowlisted fields to fixed SQL fragments and sends values as bound parameters. Unknown fields/operators, `OR`, semicolons and malformed cursors are rejected. Pagination uses an opaque cursor containing the compound `(updated_at, issue_sequence)` position, preventing skips when multiple issues share a timestamp. This is intentionally a useful subset, not a claim of Jira JQL compatibility.
 
 ### Kafka event path
 
@@ -213,6 +225,7 @@ The regression suite covers:
 - outbox lease, retry and acknowledgement;
 - publish failure, post-publish crash/replay, idempotent inbox and offset ordering;
 - hierarchy cycles, second-parent rejection, SLA pause/resume and breach observations;
+- query allowlisting, injection-shaped rejection, operational SLA filters and keyset pagination;
 - job lease ownership and expired-lease recovery;
 - deterministic triage and evidence retrieval;
 - SQL mutation, table and multi-statement rejection;
@@ -233,6 +246,7 @@ service_desk/
 ├── models.py      issue, workflow, job and tool contracts
 ├── repository.py SQLite transactions, outbox and leases
 ├── service.py     authorization and application policy
+├── search.py      bounded JQL-like compiler and keyset cursor
 ├── streaming.py   Kafka publisher, outbox dispatcher and idempotent projection
 ├── stream_worker.py  publisher/consumer CLI
 └── tools.py       registry, bounded SQL and knowledge tools
