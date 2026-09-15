@@ -3,10 +3,11 @@ from __future__ import annotations
 from dataclasses import asdict
 from typing import Annotated, Any
 
-from fastapi import APIRouter, Header, Query
+from fastapi import APIRouter, Header, Query, Response
 from pydantic import BaseModel, Field
 
 from service_desk.models import Actor, ActorRole, IssueLinkType, IssuePriority, IssueStatus
+from service_desk.observability import collect_snapshot, database_ready, render_prometheus
 from service_desk.service import ServiceDesk
 
 ActorIdHeader = Annotated[str, Header(min_length=1)]
@@ -61,6 +62,18 @@ class SLAPolicyRequest(BaseModel):
 
 def create_service_desk_router(desk: ServiceDesk) -> APIRouter:
     router = APIRouter(prefix="/v1", tags=["service-desk"])
+
+    @router.get("/operations/readiness")
+    def readiness(response: Response) -> dict[str, str]:
+        ready = database_ready(desk.repository)
+        if not ready:
+            response.status_code = 503
+        return {"status": "ready" if ready else "not_ready"}
+
+    @router.get("/operations/metrics", include_in_schema=False)
+    def operational_metrics() -> Response:
+        snapshot = collect_snapshot(desk.repository)
+        return Response(render_prometheus(snapshot), media_type="text/plain; version=0.0.4")
 
     @router.post("/projects", status_code=201)
     def create_project(payload: ProjectRequest) -> dict[str, Any]:
