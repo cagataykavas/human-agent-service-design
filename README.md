@@ -69,6 +69,18 @@ Create an issue through the REST API before publishing; keep publisher and consu
 
 Delivery is **at least once**, not exactly once: a crash after Kafka acknowledgement but before outbox acknowledgement can republish an event. The inbox primary key makes projection effects idempotent, and its insert and counter increment share a database transaction. A malformed event prevents offset commit and requires an operational poison-message policy/DLQ in a real deployment. Schema migration, authentication/TLS, broker provisioning and multi-tenant isolation remain deployment work. Docker and a live broker are required for a full integration run; unit tests cover the acknowledgement/retry/replay/offset contract without pretending to exercise a broker.
 
+### Operational telemetry
+
+`GET /v1/operations/readiness` checks the durable workflow store and returns HTTP 503 when it cannot be queried. `GET /v1/operations/metrics` exposes Prometheus text-format gauges derived from persisted state:
+
+- issue counts by bounded workflow status;
+- durable agent-job counts by state;
+- unpublished outbox count and oldest-event age;
+- active first-response and resolution SLA breaches;
+- resolution SLAs inside the configured risk horizon.
+
+Issue IDs, project IDs and user IDs are intentionally absent from metric labels to avoid unbounded cardinality. Per-issue investigation belongs in logs, traces or the audit endpoint. Practical initial alerts are sustained outbox age above the publishing SLO, a growing queued/running job imbalance, and any critical-project SLA breach. Alert thresholds are deployment policy rather than hard-coded application truth.
+
 ### Durable agent orchestration
 
 Agent work is represented as persisted jobs rather than an in-memory chain:
@@ -226,6 +238,7 @@ The regression suite covers:
 - publish failure, post-publish crash/replay, idempotent inbox and offset ordering;
 - hierarchy cycles, second-parent rejection, SLA pause/resume and breach observations;
 - query allowlisting, injection-shaped rejection, operational SLA filters and keyset pagination;
+- readiness failure, bounded-cardinality exposition and persisted backlog/SLA gauges;
 - job lease ownership and expired-lease recovery;
 - deterministic triage and evidence retrieval;
 - SQL mutation, table and multi-statement rejection;
@@ -247,6 +260,7 @@ service_desk/
 ├── repository.py SQLite transactions, outbox and leases
 ├── service.py     authorization and application policy
 ├── search.py      bounded JQL-like compiler and keyset cursor
+├── observability.py operational snapshot and Prometheus exposition
 ├── streaming.py   Kafka publisher, outbox dispatcher and idempotent projection
 ├── stream_worker.py  publisher/consumer CLI
 └── tools.py       registry, bounded SQL and knowledge tools
@@ -270,4 +284,4 @@ The core design survives those replacements because business state, asynchronous
 
 ## Interview surface
 
-`FastAPI` · `REST` · `SQL` · `Kafka` · `outbox/inbox` · `at-least-once delivery` · `SLA` · `issue hierarchy` · `workflow state machines` · `RBAC` · `optimistic concurrency` · `idempotency` · `leases` · `agent orchestration` · `tool calling` · `human approval` · `auditability`
+`FastAPI` · `REST` · `SQL` · `Kafka` · `outbox/inbox` · `at-least-once delivery` · `Prometheus` · `readiness` · `SLA` · `issue hierarchy` · `workflow state machines` · `RBAC` · `optimistic concurrency` · `idempotency` · `leases` · `agent orchestration` · `tool calling` · `human approval` · `auditability`

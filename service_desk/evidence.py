@@ -8,6 +8,7 @@ from typing import Any
 
 from service_desk.agent import AgentWorker, DeterministicAgentModel
 from service_desk.models import Actor, ActorRole, IssuePriority
+from service_desk.observability import collect_snapshot
 from service_desk.repository import SQLiteServiceDeskRepository
 from service_desk.service import ServiceDesk
 from service_desk.tools import KnowledgeSearchTool, ReadOnlySQLTool, ToolContext, ToolRegistry
@@ -123,6 +124,7 @@ def generate_evidence() -> dict[str, Any]:
         for event in outbox:
             repository.acknowledge_outbox(event.event_id, "publisher-1")
         audit = repository.audit_stream(issue.issue_id)
+        operations = collect_snapshot(repository)
         return {
             "generated_at": datetime.now(UTC).isoformat(),
             "project": {"key": project.key, "workflow": project.workflow_id},
@@ -151,6 +153,12 @@ def generate_evidence() -> dict[str, Any]:
                 else None,
             },
             "audit_event_types": [event["event_type"] for event in audit],
+            "operations": {
+                "issues_by_status": operations.issues_by_status,
+                "agent_jobs_by_state": operations.agent_jobs_by_state,
+                "outbox_pending": operations.outbox_pending,
+                "sla_resolution_breached": operations.sla_resolution_breached,
+            },
             "invariants": {
                 "idempotent_create_replayed": replay.issue_id == issue.issue_id,
                 "workflow_reached_resolution": resolved.status.value == "resolved",
@@ -162,6 +170,8 @@ def generate_evidence() -> dict[str, Any]:
                 "safe_search_found_issue": [item.issue_id for item in search.items]
                 == [issue.issue_id],
                 "sla_first_response_recorded": sla.first_responded_at is not None,
+                "operational_snapshot_matches_state": operations.issues_by_status == {"resolved": 1}
+                and operations.outbox_pending == 0,
             },
         }
 
