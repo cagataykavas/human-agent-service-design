@@ -114,6 +114,31 @@ Tool risk is assigned by a server-side allowlist. The agent cannot label `transi
 
 High-impact calls enter `waiting_for_approval`; the requesting worker loses its lease. The same actor cannot request and approve the call. Approval requeues the durable job instead of executing an untracked side effect inside an HTTP request.
 
+### Aggregate agent-plan risk gate
+
+Per-call approval is necessary but does not bound the cumulative authority of a long plan.
+`service_desk.plan_policy` evaluates the complete proposed tool sequence before execution
+using server-owned `ToolRisk` classifications.
+
+The gate enforces independent budgets for total steps, all write steps and high-impact steps.
+It rejects empty plans, duplicate call identifiers and tools outside the server allowlist, and
+returns every violation plus the risk resolved for each call as JSON-ready evidence. The agent
+never supplies or downgrades its own risk labels.
+
+```python
+decision = evaluate_plan(
+    proposed_calls,
+    server_owned_tool_risks,
+    PlanBudget(max_steps=8, max_write_steps=2, max_high_impact_steps=1),
+)
+if not decision.allowed:
+    reject_plan(decision.to_dict())
+```
+
+This is a pre-execution authority bound, not a substitute for per-call authorization, human
+approval, optimistic concurrency or runtime lease checks. Dynamic plans must be evaluated
+again whenever the model adds or replaces a step.
+
 ### Safe SQL tool
 
 The SQL tool demonstrates the boundary interviewers usually mean when asking whether an agent can “go to SQL”:
@@ -261,6 +286,7 @@ service_desk/
 ├── service.py     authorization and application policy
 ├── search.py      bounded JQL-like compiler and keyset cursor
 ├── observability.py operational snapshot and Prometheus exposition
+├── plan_policy.py  aggregate tool-step authority budgets
 ├── streaming.py   Kafka publisher, outbox dispatcher and idempotent projection
 ├── stream_worker.py  publisher/consumer CLI
 └── tools.py       registry, bounded SQL and knowledge tools
@@ -284,4 +310,4 @@ The core design survives those replacements because business state, asynchronous
 
 ## Interview surface
 
-`FastAPI` · `REST` · `SQL` · `Kafka` · `outbox/inbox` · `at-least-once delivery` · `Prometheus` · `readiness` · `SLA` · `issue hierarchy` · `workflow state machines` · `RBAC` · `optimistic concurrency` · `idempotency` · `leases` · `agent orchestration` · `tool calling` · `human approval` · `auditability`
+`FastAPI` · `REST` · `SQL` · `Kafka` · `outbox/inbox` · `at-least-once delivery` · `Prometheus` · `readiness` · `SLA` · `issue hierarchy` · `workflow state machines` · `RBAC` · `optimistic concurrency` · `idempotency` · `leases` · `agent orchestration` · `tool calling` · `plan risk budgets` · `human approval` · `auditability`
