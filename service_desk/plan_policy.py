@@ -28,9 +28,7 @@ class PlanBudget:
         if not 0 <= self.max_write_steps <= self.max_steps:
             raise ValueError("max_write_steps must be between zero and max_steps")
         if not 0 <= self.max_high_impact_steps <= self.max_write_steps:
-            raise ValueError(
-                "max_high_impact_steps must be between zero and max_write_steps"
-            )
+            raise ValueError("max_high_impact_steps must be between zero and max_write_steps")
 
 
 @dataclass(frozen=True, slots=True)
