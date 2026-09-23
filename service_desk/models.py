@@ -218,6 +218,10 @@ class ToolCall:
     requested_by: str
     approved_by: str | None
     result: dict[str, Any] | None
+    request_digest: str | None = None
+    approved_at: datetime | None = None
+    approval_expires_at: datetime | None = None
+    execution_owner: str | None = None
 
 
 @dataclass(frozen=True, slots=True)

@@ -90,12 +90,21 @@ class AgentWorker:
                     arguments={"query": output.get("query", "")},
                     requested_by=self.worker_id,
                 )
+                self.repository.start_tool_call(
+                    call.call_id,
+                    self.worker_id,
+                    call.request_digest or "",
+                )
                 tool_result = self.tools.execute(
                     call.tool_name,
                     call.arguments,
                     ToolContext(self.worker_id, job.job_id),
                 )
-                self.repository.complete_tool_call(call.call_id, tool_result)
+                self.repository.complete_tool_call(
+                    call.call_id,
+                    tool_result,
+                    execution_owner=self.worker_id,
+                )
                 output["evidence"] = tool_result["results"]
                 requested_calls.append(call.call_id)
             finished = self.repository.finish_agent_job(
