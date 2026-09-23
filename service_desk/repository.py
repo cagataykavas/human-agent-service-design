@@ -191,6 +191,10 @@ CREATE TABLE IF NOT EXISTS tool_calls (
     requested_by TEXT NOT NULL,
     approved_by TEXT,
     result_json TEXT,
+    request_digest TEXT,
+    approved_at TEXT,
+    approval_expires_at TEXT,
+    execution_owner TEXT,
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL,
     FOREIGN KEY(job_id) REFERENCES agent_jobs(job_id)
@@ -216,6 +220,23 @@ class SQLiteServiceDeskRepository:
         self._lock = threading.RLock()
         with self.connect() as connection:
             connection.executescript(SCHEMA)
+            self._migrate_tool_calls(connection)
+
+    @staticmethod
+    def _migrate_tool_calls(connection: sqlite3.Connection) -> None:
+        """Add approval-integrity fields without rewriting existing local databases."""
+        columns = {
+            row["name"] for row in connection.execute("PRAGMA table_info(tool_calls)").fetchall()
+        }
+        additions = {
+            "request_digest": "TEXT",
+            "approved_at": "TEXT",
+            "approval_expires_at": "TEXT",
+            "execution_owner": "TEXT",
+        }
+        for name, data_type in additions.items():
+            if name not in columns:
+                connection.execute(f"ALTER TABLE tool_calls ADD COLUMN {name} {data_type}")
 
     def connect(self) -> sqlite3.Connection:
         connection = sqlite3.connect(self.path, timeout=30, isolation_level=None)
@@ -804,11 +825,25 @@ class SQLiteServiceDeskRepository:
         return self._agent_job(row)
 
     def create_tool_call(self, call: ToolCall) -> ToolCall:
+        from service_desk.tool_approval import digests_match, request_digest, write_target
+
         now = self.now()
+        if not call.request_digest:
+            raise Conflict("tool request is missing its integrity digest")
+        computed_digest = request_digest(
+            job_id=call.job_id,
+            tool_name=call.tool_name,
+            risk=call.risk,
+            arguments=call.arguments,
+            requested_by=call.requested_by,
+        )
+        if not digests_match(call.request_digest, computed_digest):
+            raise Conflict("tool request digest does not match its reviewed fields")
         with self._lock, self.connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
             job = connection.execute(
-                "SELECT state, lease_owner FROM agent_jobs WHERE job_id = ?", (call.job_id,)
+                "SELECT issue_id, state, lease_owner FROM agent_jobs WHERE job_id = ?",
+                (call.job_id,),
             ).fetchone()
             if not job:
                 raise NotFound(f"agent job {call.job_id!r} not found")
@@ -816,12 +851,24 @@ class SQLiteServiceDeskRepository:
                 raise Conflict("tool calls can be requested only by a running agent job")
             if job["lease_owner"] != call.requested_by:
                 raise Conflict("tool caller must own the active agent-job lease")
+            if call.risk is not ToolRisk.READ_ONLY:
+                issue_id, expected_version = write_target(call.arguments)
+                if issue_id != job["issue_id"]:
+                    raise Conflict("write tool target must match the agent job issue")
+                issue = connection.execute(
+                    "SELECT version FROM issues WHERE issue_id = ?", (issue_id,)
+                ).fetchone()
+                if not issue:
+                    raise NotFound(f"issue {issue_id!r} not found")
+                if issue["version"] != expected_version:
+                    raise Conflict("write tool expected_version is already stale")
             connection.execute(
                 """
                 INSERT INTO tool_calls(
                     call_id, job_id, tool_name, risk, arguments_json, state, requested_by,
-                    approved_by, result_json, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, NULL, NULL, ?, ?)
+                    approved_by, result_json, request_digest, approved_at,
+                    approval_expires_at, execution_owner, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, NULL, NULL, ?, NULL, NULL, NULL, ?, ?)
                 """,
                 (
                     call.call_id,
@@ -831,6 +878,7 @@ class SQLiteServiceDeskRepository:
                     _dump(call.arguments),
                     call.state,
                     call.requested_by,
+                    call.request_digest,
                     self.time(now),
                     self.time(now),
                 ),
@@ -846,8 +894,20 @@ class SQLiteServiceDeskRepository:
             connection.commit()
         return call
 
-    def approve_tool_call(self, call_id: str, approver_id: str) -> ToolCall:
+    def approve_tool_call(
+        self,
+        call_id: str,
+        approver_id: str,
+        *,
+        approval_ttl_seconds: int = 900,
+    ) -> ToolCall:
+        from service_desk.tool_approval import digests_match, request_digest
+
+        if not 30 <= approval_ttl_seconds <= 3600:
+            raise ValueError("approval_ttl_seconds must be in [30, 3600]")
+        now = self.now()
         with self._lock, self.connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
             row = connection.execute(
                 "SELECT * FROM tool_calls WHERE call_id = ?", (call_id,)
             ).fetchone()
@@ -857,9 +917,29 @@ class SQLiteServiceDeskRepository:
                 raise Conflict("tool call is not waiting for approval")
             if row["requested_by"] == approver_id:
                 raise Conflict("high-impact tool calls require a different approver")
+            if not row["request_digest"]:
+                raise Conflict("legacy tool call has no review digest and must be recreated")
+            computed_digest = request_digest(
+                job_id=row["job_id"],
+                tool_name=row["tool_name"],
+                risk=ToolRisk(row["risk"]),
+                arguments=json.loads(row["arguments_json"]),
+                requested_by=row["requested_by"],
+            )
+            if not digests_match(row["request_digest"], computed_digest):
+                raise Conflict("tool request changed after it was created")
             connection.execute(
-                "UPDATE tool_calls SET state = 'approved', approved_by = ?, updated_at = ? WHERE call_id = ?",
-                (approver_id, self.time(self.now()), call_id),
+                """
+                UPDATE tool_calls SET state = 'approved', approved_by = ?, approved_at = ?,
+                    approval_expires_at = ?, updated_at = ? WHERE call_id = ?
+                """,
+                (
+                    approver_id,
+                    self.time(now),
+                    self.time(now + timedelta(seconds=approval_ttl_seconds)),
+                    self.time(now),
+                    call_id,
+                ),
             )
             connection.execute(
                 """
@@ -868,7 +948,7 @@ class SQLiteServiceDeskRepository:
                 """,
                 (
                     AgentJobState.QUEUED.value,
-                    self.time(self.now()),
+                    self.time(now),
                     row["job_id"],
                     AgentJobState.WAITING_FOR_APPROVAL.value,
                 ),
@@ -876,17 +956,92 @@ class SQLiteServiceDeskRepository:
             updated = connection.execute(
                 "SELECT * FROM tool_calls WHERE call_id = ?", (call_id,)
             ).fetchone()
+            connection.commit()
         return self._tool_call(updated)
 
-    def complete_tool_call(self, call_id: str, result: dict[str, Any]) -> ToolCall:
+    def start_tool_call(
+        self,
+        call_id: str,
+        execution_owner: str,
+        expected_request_digest: str,
+    ) -> ToolCall:
+        """Atomically admit the exact reviewed call immediately before side effects."""
+        from service_desk.tool_approval import digests_match, request_digest, write_target
+
+        if not execution_owner.strip():
+            raise ValueError("execution_owner must not be empty")
+        now = self.now()
+        with self._lock, self.connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                "SELECT * FROM tool_calls WHERE call_id = ?", (call_id,)
+            ).fetchone()
+            if not row:
+                raise NotFound(f"tool call {call_id!r} not found")
+            expected_state = "ready" if row["risk"] == ToolRisk.READ_ONLY.value else "approved"
+            if row["state"] != expected_state:
+                raise Conflict("tool call is not ready for execution admission")
+            job = connection.execute(
+                "SELECT state, lease_owner FROM agent_jobs WHERE job_id = ?", (row["job_id"],)
+            ).fetchone()
+            if (
+                not job
+                or job["state"] != AgentJobState.RUNNING.value
+                or job["lease_owner"] != execution_owner
+            ):
+                raise Conflict("tool execution requires the active agent-job lease")
+            stored_digest = row["request_digest"]
+            if not stored_digest:
+                raise Conflict("tool call has no review digest and must be recreated")
+            computed_digest = request_digest(
+                job_id=row["job_id"],
+                tool_name=row["tool_name"],
+                risk=ToolRisk(row["risk"]),
+                arguments=json.loads(row["arguments_json"]),
+                requested_by=row["requested_by"],
+            )
+            if not (
+                digests_match(stored_digest, computed_digest)
+                and digests_match(stored_digest, expected_request_digest)
+            ):
+                raise Conflict("tool request does not match the reviewed digest")
+            if row["risk"] != ToolRisk.READ_ONLY.value:
+                if not row["approval_expires_at"]:
+                    raise Conflict("write tool approval has no expiry")
+                if datetime.fromisoformat(row["approval_expires_at"]) <= now:
+                    raise Conflict("write tool approval has expired")
+                issue_id, expected_version = write_target(json.loads(row["arguments_json"]))
+                issue = connection.execute(
+                    "SELECT version FROM issues WHERE issue_id = ?", (issue_id,)
+                ).fetchone()
+                if not issue:
+                    raise NotFound(f"issue {issue_id!r} not found")
+                if issue["version"] != expected_version:
+                    raise Conflict("write tool target changed after human approval")
+            connection.execute(
+                """
+                UPDATE tool_calls SET state = 'executing', execution_owner = ?, updated_at = ?
+                WHERE call_id = ?
+                """,
+                (execution_owner, self.time(now), call_id),
+            )
+            updated = connection.execute(
+                "SELECT * FROM tool_calls WHERE call_id = ?", (call_id,)
+            ).fetchone()
+            connection.commit()
+        return self._tool_call(updated)
+
+    def complete_tool_call(
+        self, call_id: str, result: dict[str, Any], *, execution_owner: str
+    ) -> ToolCall:
         with self._lock, self.connect() as connection:
             row = connection.execute(
                 "SELECT * FROM tool_calls WHERE call_id = ?", (call_id,)
             ).fetchone()
             if not row:
                 raise NotFound(f"tool call {call_id!r} not found")
-            if row["state"] not in {"approved", "ready"}:
-                raise Conflict("tool call is not executable")
+            if row["state"] != "executing" or row["execution_owner"] != execution_owner:
+                raise Conflict("only the admitted execution owner can complete a tool call")
             connection.execute(
                 "UPDATE tool_calls SET state = 'succeeded', result_json = ?, updated_at = ? WHERE call_id = ?",
                 (_dump(result), self.time(self.now()), call_id),
@@ -1192,6 +1347,12 @@ class SQLiteServiceDeskRepository:
             requested_by=row["requested_by"],
             approved_by=row["approved_by"],
             result=json.loads(row["result_json"]) if row["result_json"] else None,
+            request_digest=row["request_digest"],
+            approved_at=datetime.fromisoformat(row["approved_at"]) if row["approved_at"] else None,
+            approval_expires_at=datetime.fromisoformat(row["approval_expires_at"])
+            if row["approval_expires_at"]
+            else None,
+            execution_owner=row["execution_owner"],
         )
 
     def _audit(

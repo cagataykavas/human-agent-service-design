@@ -27,6 +27,7 @@ from service_desk.models import (
     default_workflow,
 )
 from service_desk.repository import SQLiteServiceDeskRepository
+from service_desk.tool_approval import request_digest, write_target
 
 
 def _hash(payload: dict[str, Any]) -> str:
@@ -284,22 +285,44 @@ class ServiceDesk:
             risk = self.tool_risks[tool_name]
         except KeyError as exc:
             raise Forbidden(f"tool {tool_name!r} is not allowlisted") from exc
+        normalized_arguments = dict(arguments)
+        if risk is not ToolRisk.READ_ONLY:
+            write_target(normalized_arguments)
         state = "ready" if risk is ToolRisk.READ_ONLY else "waiting_for_approval"
+        selected_call_id = call_id or str(uuid4())
+        digest = request_digest(
+            job_id=job_id,
+            tool_name=tool_name,
+            risk=risk,
+            arguments=normalized_arguments,
+            requested_by=requested_by,
+        )
         return self.repository.create_tool_call(
             ToolCall(
-                call_id=call_id or str(uuid4()),
+                call_id=selected_call_id,
                 job_id=job_id,
                 tool_name=tool_name,
                 risk=risk,
-                arguments=dict(arguments),
+                arguments=normalized_arguments,
                 state=state,
                 requested_by=requested_by,
                 approved_by=None,
                 result=None,
+                request_digest=digest,
             )
         )
 
-    def approve_tool_call(self, call_id: str, *, actor: Actor) -> ToolCall:
+    def approve_tool_call(
+        self,
+        call_id: str,
+        *,
+        actor: Actor,
+        approval_ttl_seconds: int = 900,
+    ) -> ToolCall:
         if actor.role not in {ActorRole.AGENT, ActorRole.ADMIN}:
             raise Forbidden("only a human agent or admin can approve write tools")
-        return self.repository.approve_tool_call(call_id, actor.actor_id)
+        return self.repository.approve_tool_call(
+            call_id,
+            actor.actor_id,
+            approval_ttl_seconds=approval_ttl_seconds,
+        )
