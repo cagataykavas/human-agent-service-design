@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import re
 import sqlite3
+from contextlib import closing
 from dataclasses import dataclass
 from typing import Any, Protocol
 
@@ -63,10 +64,15 @@ class ReadOnlySQLTool:
         *,
         allowed_tables: frozenset[str] = frozenset({"issues", "projects"}),
         max_rows: int = 100,
+        max_vm_steps: int = 100_000,
     ) -> None:
+        for name, value in (("max_rows", max_rows), ("max_vm_steps", max_vm_steps)):
+            if type(value) is not int or value < 1:
+                raise ValueError(f"{name} must be a positive integer")
         self.database_path = database_path
         self.allowed_tables = allowed_tables
         self.max_rows = max_rows
+        self.max_vm_steps = max_vm_steps
 
     def validate(self, sql: str) -> str:
         candidate = sql.strip()
@@ -92,16 +98,30 @@ class ReadOnlySQLTool:
         parameters = arguments.get("parameters", {})
         if not isinstance(parameters, dict):
             raise ToolPolicyViolation("parameters must be a JSON object")
+        # The server owns this budget; model-supplied arguments cannot raise it.
+        remaining_steps = self.max_vm_steps
+        progress_interval = min(1000, remaining_steps)
+        exhausted = False
+
+        def check_budget() -> int:
+            nonlocal remaining_steps, exhausted
+            remaining_steps -= progress_interval
+            exhausted = remaining_steps <= 0
+            return int(exhausted)
+
         uri = f"file:{self.database_path}?mode=ro"
         try:
-            with sqlite3.connect(uri, uri=True, timeout=2) as connection:
+            with closing(sqlite3.connect(uri, uri=True, timeout=2)) as connection:
                 connection.row_factory = sqlite3.Row
                 connection.execute("PRAGMA query_only = ON")
                 connection.execute("PRAGMA busy_timeout = 2000")
+                connection.set_progress_handler(check_budget, progress_interval)
                 cursor = connection.execute(sql, parameters)
                 columns = [column[0] for column in cursor.description or ()]
                 rows = cursor.fetchmany(self.max_rows + 1)
         except sqlite3.Error as exc:
+            if exhausted:
+                raise ToolPolicyViolation("query exceeded VM instruction budget") from None
             raise ToolPolicyViolation(f"query rejected by database: {exc}") from exc
         truncated = len(rows) > self.max_rows
         selected = rows[: self.max_rows]
