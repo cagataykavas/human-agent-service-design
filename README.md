@@ -124,9 +124,19 @@ The SQL tool demonstrates the boundary interviewers usually mean when asking whe
 - uses named parameters;
 - opens SQLite in `mode=ro` and enables `query_only`;
 - caps returned rows and reports truncation;
+- interrupts expensive SQLite VM work using a server-owned instruction budget;
 - associates output with the originating durable job.
 
-This lightweight validator is appropriate for a local reference adapter. Production should parse SQL into an AST using the target dialect, query a read replica with a dedicated least-privilege identity, enforce execution timeout/cost limits and log query fingerprints.
+`ReadOnlySQLTool(..., max_rows=100, max_vm_steps=100_000,
+max_result_bytes=65_536, max_execution_seconds=2.0)` applies server-owned work,
+wall-clock and serialized-response budgets during execution and row fetching. A
+one-row aggregate or one oversized value does not bypass them. Budget exhaustion
+raises `ToolPolicyViolation` without partial results or query/parameter text; each
+call starts with fresh budgets, and its read-only connection is explicitly closed
+on success or failure. Accepted responses expose only a SHA-256 query fingerprint,
+not raw parameters. See [SQL work-budget boundaries](docs/sql-work-budget.md).
+
+This lightweight validator is appropriate for a local reference adapter. Production should parse SQL into an AST using the target dialect, query a read replica with a dedicated least-privilege identity, and add a supervised process-level memory limit. The cooperative SQLite deadline is not a hard real-time preemption guarantee.
 
 ## Transaction boundaries
 
