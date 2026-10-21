@@ -1,7 +1,12 @@
 from __future__ import annotations
 
+import hashlib
+import json
+import math
 import re
 import sqlite3
+import time
+from collections.abc import Callable
 from contextlib import closing
 from dataclasses import dataclass
 from typing import Any, Protocol
@@ -65,14 +70,33 @@ class ReadOnlySQLTool:
         allowed_tables: frozenset[str] = frozenset({"issues", "projects"}),
         max_rows: int = 100,
         max_vm_steps: int = 100_000,
+        max_result_bytes: int = 64 * 1024,
+        max_execution_seconds: float = 2.0,
+        clock: Callable[[], float] = time.monotonic,
     ) -> None:
-        for name, value in (("max_rows", max_rows), ("max_vm_steps", max_vm_steps)):
+        for name, value in (
+            ("max_rows", max_rows),
+            ("max_vm_steps", max_vm_steps),
+            ("max_result_bytes", max_result_bytes),
+        ):
             if type(value) is not int or value < 1:
                 raise ValueError(f"{name} must be a positive integer")
+        if max_result_bytes > 16 * 1024 * 1024:
+            raise ValueError("max_result_bytes must not exceed 16777216")
+        if (
+            isinstance(max_execution_seconds, bool)
+            or not isinstance(max_execution_seconds, (int, float))
+            or not math.isfinite(max_execution_seconds)
+            or not 0 < max_execution_seconds <= 300
+        ):
+            raise ValueError("max_execution_seconds must be a finite number between 0 and 300")
         self.database_path = database_path
         self.allowed_tables = allowed_tables
         self.max_rows = max_rows
         self.max_vm_steps = max_vm_steps
+        self.max_result_bytes = max_result_bytes
+        self.max_execution_seconds = float(max_execution_seconds)
+        self._clock = clock
 
     def validate(self, sql: str) -> str:
         candidate = sql.strip()
@@ -98,40 +122,132 @@ class ReadOnlySQLTool:
         parameters = arguments.get("parameters", {})
         if not isinstance(parameters, dict):
             raise ToolPolicyViolation("parameters must be a JSON object")
-        # The server owns this budget; model-supplied arguments cannot raise it.
+        query_fingerprint = self._query_fingerprint(sql, parameters)
+        deadline = self._clock() + self.max_execution_seconds
+        # The server owns these budgets; model-supplied arguments cannot raise them.
         remaining_steps = self.max_vm_steps
         progress_interval = min(1000, remaining_steps)
-        exhausted = False
+        vm_exhausted = False
+        deadline_exhausted = False
 
         def check_budget() -> int:
-            nonlocal remaining_steps, exhausted
+            nonlocal remaining_steps, vm_exhausted, deadline_exhausted
+            if self._clock() >= deadline:
+                deadline_exhausted = True
+                return 1
             remaining_steps -= progress_interval
-            exhausted = remaining_steps <= 0
-            return int(exhausted)
+            vm_exhausted = remaining_steps <= 0
+            return int(vm_exhausted)
+
+        def require_time() -> None:
+            nonlocal deadline_exhausted
+            if self._clock() >= deadline:
+                deadline_exhausted = True
+                raise ToolPolicyViolation("query exceeded wall-clock budget")
 
         uri = f"file:{self.database_path}?mode=ro"
         try:
-            with closing(sqlite3.connect(uri, uri=True, timeout=2)) as connection:
+            require_time()
+            with closing(
+                sqlite3.connect(
+                    uri,
+                    uri=True,
+                    timeout=min(2.0, self.max_execution_seconds),
+                )
+            ) as connection:
                 connection.row_factory = sqlite3.Row
+                remaining_ms = max(1, int((deadline - self._clock()) * 1000))
+                connection.execute(f"PRAGMA busy_timeout = {min(2000, remaining_ms)}")
                 connection.execute("PRAGMA query_only = ON")
-                connection.execute("PRAGMA busy_timeout = 2000")
                 connection.set_progress_handler(check_budget, progress_interval)
+                require_time()
                 cursor = connection.execute(sql, parameters)
                 columns = [column[0] for column in cursor.description or ()]
-                rows = cursor.fetchmany(self.max_rows + 1)
+                rows: list[dict[str, Any]] = []
+                truncated = False
+                for row in cursor:
+                    require_time()
+                    if len(rows) == self.max_rows:
+                        truncated = True
+                        break
+                    rows.append(dict(row))
+                    self._require_result_budget(
+                        self._result_payload(
+                            columns,
+                            rows,
+                            truncated=False,
+                            job_id=context.job_id,
+                            query_fingerprint=query_fingerprint,
+                        )
+                    )
+                require_time()
+                result = self._result_payload(
+                    columns,
+                    rows,
+                    truncated=truncated,
+                    job_id=context.job_id,
+                    query_fingerprint=query_fingerprint,
+                )
+                self._require_result_budget(result)
+                return result
+        except ToolPolicyViolation:
+            raise
         except sqlite3.Error as exc:
-            if exhausted:
+            if deadline_exhausted or self._clock() >= deadline:
+                raise ToolPolicyViolation("query exceeded wall-clock budget") from None
+            if "locked" in str(exc).lower():
+                # Lock acquisition consumed the configured busy timeout. Keep the
+                # public failure stable without exposing database details.
+                raise ToolPolicyViolation("query exceeded wall-clock budget") from None
+            if vm_exhausted:
                 raise ToolPolicyViolation("query exceeded VM instruction budget") from None
-            raise ToolPolicyViolation(f"query rejected by database: {exc}") from exc
-        truncated = len(rows) > self.max_rows
-        selected = rows[: self.max_rows]
+            if isinstance(exc, sqlite3.DataError):
+                raise ToolPolicyViolation("query result exceeded byte budget") from None
+            raise ToolPolicyViolation("query rejected by database") from exc
+
+    @staticmethod
+    def _query_fingerprint(sql: str, parameters: dict[str, Any]) -> str:
+        evidence = json.dumps(
+            {
+                "sql": sql,
+                "parameter_names": sorted(str(name) for name in parameters),
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+        return hashlib.sha256(evidence).hexdigest()
+
+    @staticmethod
+    def _result_payload(
+        columns: list[str],
+        rows: list[dict[str, Any]],
+        *,
+        truncated: bool,
+        job_id: str,
+        query_fingerprint: str,
+    ) -> dict[str, Any]:
         return {
             "columns": columns,
-            "rows": [dict(row) for row in selected],
-            "row_count": len(selected),
+            "rows": rows,
+            "row_count": len(rows),
             "truncated": truncated,
-            "job_id": context.job_id,
+            "job_id": job_id,
+            "query_fingerprint": query_fingerprint,
         }
+
+    def _require_result_budget(self, payload: dict[str, Any]) -> None:
+        try:
+            rendered = json.dumps(
+                payload,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+                allow_nan=False,
+            ).encode("utf-8")
+        except (TypeError, ValueError) as exc:
+            raise ToolPolicyViolation("query result is not bounded JSON") from exc
+        if len(rendered) > self.max_result_bytes:
+            raise ToolPolicyViolation("query result exceeded byte budget")
 
 
 class KnowledgeSearchTool:

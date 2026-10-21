@@ -2,15 +2,25 @@
 
 Returning at most 100 rows does not bound database work: `SELECT count(*)` over
 large Cartesian joins returns one row after visiting many combinations. The
-agent's read-only SQL tool now has two independent, positive-integer limits:
+agent's read-only SQL tool now has four independent server-owned limits:
 
 - `max_rows=100`: returned rows (one extra row is fetched to detect truncation).
 - `max_vm_steps=100_000`: cooperative SQLite virtual-machine instruction budget.
+- `max_result_bytes=65_536`: exact canonical JSON response ceiling, checked as
+  rows are fetched and again on the final envelope.
+- `max_execution_seconds=2.0`: monotonic execution deadline, also used to cap
+  SQLite lock waiting.
 
 Configure these in trusted Python code, not model tool arguments:
 
 ```python
-tool = ReadOnlySQLTool(database_path, max_rows=50, max_vm_steps=200_000)
+tool = ReadOnlySQLTool(
+    database_path,
+    max_rows=50,
+    max_vm_steps=200_000,
+    max_result_bytes=32_768,
+    max_execution_seconds=1.0,
+)
 ```
 
 The progress handler is installed before the untrusted query is prepared/executed
@@ -23,17 +33,21 @@ counts; this is not a portable query-cost estimate or benchmark score.
 An interrupted query raises the stable `ToolPolicyViolation` message
 `query exceeded VM instruction budget`. It returns no partial rows and does not
 echo the SQL or bound parameters. Each execution uses a fresh connection and
-budget, so a rejected query cannot poison the next call. Connections close on
-normal return, database errors, and budget interruption. Existing read-only mode,
-query-only PRAGMA, table validation, bound parameters, and response fields remain.
+budgets, so a rejected query cannot poison the next call. Connections close on
+normal return, database errors, and budget interruption. Accepted responses include
+a SHA-256 fingerprint over validated SQL and sorted parameter names. Parameter
+values are deliberately excluded.
 
 ## Trust and resource boundary
 
-This does **not** guarantee a wall-clock deadline, memory ceiling, maximum result
-bytes, or bounded database lock waits. A single opcode, disk operation, or native
-extension/function can do substantial work between callbacks. SQLite's two-second
-busy timeout concerns lock waits, not query execution time. No user-defined
-functions or extensions are installed by this tool.
+The monotonic deadline is checked by SQLite's progress callback and around fetches;
+the remaining budget also caps the busy timeout. It cannot preempt a single native
+opcode or system call mid-execution, so it is not a hard real-time guarantee. The
+result ceiling checks the exact serialized response after every accepted row, so
+the remaining result set is never materialized after the ceiling is crossed. It
+does not impose a process-wide memory ceiling, and a single SQLite value can be
+allocated before the response check runs. No user-defined functions or extensions
+are installed.
 
 The existing regex SQL validator is not an AST parser or a complete table-access
 security policy. Keep the read model non-sensitive and use least-privilege
@@ -49,6 +63,6 @@ budget enforcement, invalid configuration, response compatibility, error
 redaction, and connection cleanup on every exit path. These are correctness tests,
 not a claim of measured throughput improvement.
 
-Next, execute agent queries in a supervised worker with a hard wall-clock deadline
-and memory/result-byte ceilings; fingerprint queries for operational diagnostics
-without storing raw customer parameters.
+Next, execute queries in a supervised worker with a process-level address-space
+limit and authenticated execution receipt, retaining the same response-byte and
+query-fingerprint contract.
