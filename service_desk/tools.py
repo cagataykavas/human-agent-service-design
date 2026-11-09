@@ -57,11 +57,37 @@ class ReadOnlySQLTool:
 
     name = "service_desk_sql"
     risk = ToolRisk.READ_ONLY
-    _forbidden = re.compile(
-        r"\b(INSERT|UPDATE|DELETE|DROP|ALTER|CREATE|REPLACE|ATTACH|DETACH|PRAGMA|VACUUM|REINDEX|TRIGGER)\b",
-        re.IGNORECASE,
+    # Explicit built-in analytics functions only. No extensions or application UDFs
+    # are registered on this tool's private, per-execution connection.
+    _max_sql_bytes = 64 * 1024
+    _max_pattern_bytes = 1024
+    _allowed_functions = frozenset(
+        {
+            "abs",
+            "avg",
+            "coalesce",
+            "count",
+            "ifnull",
+            "length",
+            "lower",
+            "ltrim",
+            "max",
+            "min",
+            "nullif",
+            "printf",
+            "round",
+            "rtrim",
+            "substr",
+            "substring",
+            "sum",
+            "total",
+            "trim",
+            "typeof",
+            "upper",
+            "like",
+            "glob",
+        }
     )
-    _table_reference = re.compile(r"\b(?:FROM|JOIN)\s+([A-Za-z_][A-Za-z0-9_]*)", re.IGNORECASE)
 
     def __init__(
         self,
@@ -91,7 +117,7 @@ class ReadOnlySQLTool:
         ):
             raise ValueError("max_execution_seconds must be a finite number between 0 and 300")
         self.database_path = database_path
-        self.allowed_tables = allowed_tables
+        self.allowed_tables = frozenset(name.lower() for name in allowed_tables)
         self.max_rows = max_rows
         self.max_vm_steps = max_vm_steps
         self.max_result_bytes = max_result_bytes
@@ -99,23 +125,14 @@ class ReadOnlySQLTool:
         self._clock = clock
 
     def validate(self, sql: str) -> str:
+        # Shape validation only, never an authorization decision. SQLite itself
+        # parses quoted identifiers, comments, CTEs and statement boundaries.
+        if len(sql.encode("utf-8")) > self._max_sql_bytes:
+            raise ToolPolicyViolation("query exceeded SQL text byte budget")
         candidate = sql.strip()
-        if self._forbidden.search(candidate):
-            raise ToolPolicyViolation("query contains a forbidden SQL operation")
-        if not candidate or not re.match(r"^(SELECT|WITH)\b", candidate, re.IGNORECASE):
-            raise ToolPolicyViolation("SQL tool accepts only SELECT or WITH queries")
-        without_final = candidate.removesuffix(";")
-        if ";" in without_final:
-            raise ToolPolicyViolation("multiple SQL statements are forbidden")
-        referenced = {match.lower() for match in self._table_reference.findall(candidate)}
-        forbidden_tables = referenced - self.allowed_tables
-        if forbidden_tables:
-            raise ToolPolicyViolation(
-                "query references non-allowlisted tables: " + ", ".join(sorted(forbidden_tables))
-            )
-        if not referenced:
-            raise ToolPolicyViolation("query must reference an allowlisted table")
-        return without_final
+        if not candidate:
+            raise ToolPolicyViolation("SQL tool requires a nonempty query")
+        return candidate
 
     def execute(self, arguments: dict[str, Any], context: ToolContext) -> dict[str, Any]:
         sql = self.validate(str(arguments.get("sql", "")))
@@ -145,6 +162,31 @@ class ReadOnlySQLTool:
                 deadline_exhausted = True
                 raise ToolPolicyViolation("query exceeded wall-clock budget")
 
+        read_allowed_table = False
+        authorization_denied = False
+
+        def authorize(action, first, second, database, source):
+            nonlocal read_allowed_table, authorization_denied
+            if action in (sqlite3.SQLITE_SELECT, sqlite3.SQLITE_RECURSIVE):
+                return sqlite3.SQLITE_OK
+            if action == sqlite3.SQLITE_READ:
+                # SQLite reports database=None for a table read with no columns
+                # (e.g. count(*)). This private connection has only main and an
+                # empty temp schema; ATTACH and temp object creation are denied.
+                if (database == "main" or (database is None and second == "")) and (
+                    first and first.lower() in readable_tables
+                ):
+                    read_allowed_table = True
+                    return sqlite3.SQLITE_OK
+            elif (
+                action == sqlite3.SQLITE_FUNCTION
+                and second
+                and second.lower() in self._allowed_functions
+            ):
+                return sqlite3.SQLITE_OK
+            authorization_denied = True
+            return sqlite3.SQLITE_DENY
+
         uri = f"file:{self.database_path}?mode=ro"
         try:
             require_time()
@@ -159,9 +201,32 @@ class ReadOnlySQLTool:
                 remaining_ms = max(1, int((deadline - self._clock()) * 1000))
                 connection.execute(f"PRAGMA busy_timeout = {min(2000, remaining_ms)}")
                 connection.execute("PRAGMA query_only = ON")
+                connection.execute("PRAGMA trusted_schema = OFF")
+                # Only ordinary main-schema tables, not views/virtual tables or
+                # shadow tables. Database schema and tool configuration are trusted.
+                readable_tables = {
+                    row[1].lower()
+                    for row in connection.execute("PRAGMA main.table_list")
+                    if row[0] == "main"
+                    and row[2] == "table"
+                    and not row[1].lower().startswith("sqlite_")
+                    and row[1].lower() in self.allowed_tables
+                }
+                # Native value/record bounds constrain individual built-in results
+                # before Python fetching/JSON checks. Not a process memory limit.
+                connection.setlimit(
+                    sqlite3.SQLITE_LIMIT_LENGTH, max(64 * 1024, self.max_result_bytes)
+                )
+                connection.setlimit(sqlite3.SQLITE_LIMIT_SQL_LENGTH, self._max_sql_bytes)
+                connection.setlimit(
+                    sqlite3.SQLITE_LIMIT_LIKE_PATTERN_LENGTH, self._max_pattern_bytes
+                )
+                connection.set_authorizer(authorize)
                 connection.set_progress_handler(check_budget, progress_interval)
                 require_time()
                 cursor = connection.execute(sql, parameters)
+                if not read_allowed_table or cursor.description is None:
+                    raise ToolPolicyViolation("query must reference an allowlisted table")
                 columns = [column[0] for column in cursor.description or ()]
                 rows: list[dict[str, Any]] = []
                 truncated = False
@@ -193,6 +258,12 @@ class ReadOnlySQLTool:
         except ToolPolicyViolation:
             raise
         except sqlite3.Error as exc:
+            if authorization_denied:
+                raise ToolPolicyViolation(
+                    "query contains a forbidden operation or non-allowlisted access"
+                ) from None
+            if isinstance(exc, sqlite3.ProgrammingError) and "one statement" in str(exc):
+                raise ToolPolicyViolation("multiple SQL statements are forbidden") from None
             if deadline_exhausted or self._clock() >= deadline:
                 raise ToolPolicyViolation("query exceeded wall-clock budget") from None
             if "locked" in str(exc).lower():
@@ -203,7 +274,7 @@ class ReadOnlySQLTool:
                 raise ToolPolicyViolation("query exceeded VM instruction budget") from None
             if isinstance(exc, sqlite3.DataError):
                 raise ToolPolicyViolation("query result exceeded byte budget") from None
-            raise ToolPolicyViolation("query rejected by database") from exc
+            raise ToolPolicyViolation("query rejected by database") from None
 
     @staticmethod
     def _query_fingerprint(sql: str, parameters: dict[str, Any]) -> str:

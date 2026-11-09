@@ -118,9 +118,9 @@ High-impact calls enter `waiting_for_approval`; the requesting worker loses its 
 
 The SQL tool demonstrates the boundary interviewers usually mean when asking whether an agent can “go to SQL”:
 
-- accepts one `SELECT` or `WITH` statement;
+- accepts one read-only query (including CTEs);
 - rejects mutation, DDL, PRAGMA, attach and multi-statement input;
-- allows only configured read-model tables;
+- enforces configured ordinary `main`-schema tables with SQLite’s authorizer;
 - uses named parameters;
 - opens SQLite in `mode=ro` and enables `query_only`;
 - caps returned rows and reports truncation;
@@ -129,14 +129,16 @@ The SQL tool demonstrates the boundary interviewers usually mean when asking whe
 
 `ReadOnlySQLTool(..., max_rows=100, max_vm_steps=100_000,
 max_result_bytes=65_536, max_execution_seconds=2.0)` applies server-owned work,
-wall-clock and serialized-response budgets during execution and row fetching. A
+wall-clock and serialized-response budgets during execution and row fetching.
+Native SQLite limits additionally cap individual values/records, SQL text and
+LIKE/GLOB patterns before fetching; see the documented printf NULL behavior. A
 one-row aggregate or one oversized value does not bypass them. Budget exhaustion
 raises `ToolPolicyViolation` without partial results or query/parameter text; each
 call starts with fresh budgets, and its read-only connection is explicitly closed
 on success or failure. Accepted responses expose only a SHA-256 query fingerprint,
 not raw parameters. See [SQL work-budget boundaries](docs/sql-work-budget.md).
 
-This lightweight validator is appropriate for a local reference adapter. Production should parse SQL into an AST using the target dialect, query a read replica with a dedicated least-privilege identity, and add a supervised process-level memory limit. The cooperative SQLite deadline is not a hard real-time preemption guarantee.
+SQLite authorization is enforced during statement preparation, rather than by regex table extraction. Functions have an explicit analytics allowlist; views, virtual tables, schema introspection and other operations are denied. This is a local reference adapter over a trusted database/schema, not a universal SQL sandbox. Production still needs a dedicated least-privilege database identity, tenant/column policies where required, and supervised process-level resource limits. The cooperative SQLite deadline is not a hard real-time preemption guarantee.
 
 ## Transaction boundaries
 
