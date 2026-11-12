@@ -15,6 +15,7 @@ kafka = ["confluent-kafka>=2.4,<3"]
 
 [project.scripts]
 service-desk-evidence = "service_desk.evidence:main"
+service-desk-run-audit = "service_desk.run_audit:main"
 service-desk-stream = "service_desk.stream_worker:main"
 
 [tool.setuptools]
