@@ -22,5 +22,9 @@ class ToolPolicyViolation(ServiceDeskError):
     pass
 
 
+class AgentOutputViolation(ServiceDeskError):
+    pass
+
+
 class InvalidIssueQuery(ServiceDeskError, ValueError):
     pass
