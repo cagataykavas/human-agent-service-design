@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, Protocol
 
+from service_desk.agent_contracts import failure_code, validate_model_output
 from service_desk.models import AgentJob, AgentJobState, IssuePriority
 from service_desk.repository import SQLiteServiceDeskRepository
 from service_desk.service import ServiceDesk
@@ -82,7 +83,10 @@ class AgentWorker:
             return None
         requested_calls: list[str] = []
         try:
-            output = self.model.complete(job.capability, job.input_payload)
+            output = validate_model_output(
+                job.capability,
+                self.model.complete(job.capability, job.input_payload),
+            )
             if job.capability == "retrieve_knowledge":
                 call = self.desk.request_tool_call(
                     job_id=job.job_id,
@@ -110,6 +114,6 @@ class AgentWorker:
                 job.job_id,
                 self.worker_id,
                 AgentJobState.FAILED,
-                error=f"{type(exc).__name__}: {exc}",
+                error=failure_code(exc),
             )
         return AgentExecutionResult(finished, tuple(requested_calls))
