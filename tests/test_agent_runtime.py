@@ -11,8 +11,8 @@ from service_desk.service import ServiceDesk
 from service_desk.tools import KnowledgeSearchTool, ReadOnlySQLTool, ToolContext, ToolRegistry
 
 
-def setup_desk(tmp_path: Path):
-    repository = SQLiteServiceDeskRepository(tmp_path / "desk.db")
+def setup_desk(tmp_path: Path, *, clock=None):
+    repository = SQLiteServiceDeskRepository(tmp_path / "desk.db", clock=clock)
     desk = ServiceDesk(repository)
     desk.bootstrap()
     desk.create_project(key="SEC", name="Security", project_id="project-1")
@@ -42,17 +42,19 @@ def test_agent_job_claim_is_leased_and_only_owner_can_finish(tmp_path: Path) -> 
     assert claimed.state is AgentJobState.RUNNING
     assert claimed.attempt == 1
     assert repository.claim_agent_job("worker-b") is None
-    with pytest.raises(Conflict, match="active worker"):
+    with pytest.raises(Conflict, match="active.*worker"):
         repository.finish_agent_job(
             claimed.job_id,
             "worker-b",
             AgentJobState.SUCCEEDED,
+            expected_attempt=claimed.attempt,
             output={"category": "incident"},
         )
     finished = repository.finish_agent_job(
         claimed.job_id,
         "worker-a",
         AgentJobState.SUCCEEDED,
+        expected_attempt=claimed.attempt,
         output={"category": "incident"},
     )
     assert finished.output_payload == {"category": "incident"}
@@ -91,6 +93,102 @@ def test_expired_job_lease_is_recoverable(tmp_path: Path) -> None:
     assert reclaimed is not None
     assert reclaimed.attempt == 2
     assert reclaimed.lease_owner == "worker-b"
+
+
+def test_expired_attempt_cannot_finish_or_request_tools(tmp_path: Path) -> None:
+    class Clock:
+        value = datetime(2026, 11, 18, tzinfo=UTC)
+
+        def __call__(self):
+            return self.value
+
+    clock = Clock()
+    repository, desk, issue = setup_desk(tmp_path, clock=clock)
+    desk.request_agent_job(
+        issue.issue_id,
+        "triage",
+        {"summary": issue.summary},
+        actor=Actor("agent-1", ActorRole.AGENT),
+        job_id="job-1",
+    )
+    claimed = repository.claim_agent_job("stable-worker", lease_seconds=30)
+    assert claimed is not None
+    clock.value += timedelta(seconds=31)
+
+    with pytest.raises(Conflict, match="active, unexpired worker attempt"):
+        repository.finish_agent_job(
+            claimed.job_id,
+            "stable-worker",
+            AgentJobState.SUCCEEDED,
+            expected_attempt=claimed.attempt,
+            output={"category": "incident"},
+        )
+    with pytest.raises(Conflict, match="lease has expired"):
+        desk.request_tool_call(
+            job_id=claimed.job_id,
+            job_attempt=claimed.attempt,
+            tool_name="knowledge_search",
+            arguments={"query": "vpn"},
+            requested_by="stable-worker",
+        )
+
+
+def test_same_worker_id_cannot_reuse_stale_attempt_token(tmp_path: Path) -> None:
+    class Clock:
+        value = datetime(2026, 11, 18, tzinfo=UTC)
+
+        def __call__(self):
+            return self.value
+
+    clock = Clock()
+    repository, desk, issue = setup_desk(tmp_path, clock=clock)
+    desk.request_agent_job(
+        issue.issue_id,
+        "triage",
+        {"summary": issue.summary},
+        actor=Actor("agent-1", ActorRole.AGENT),
+        job_id="job-1",
+    )
+    first = repository.claim_agent_job("stable-worker", lease_seconds=30)
+    assert first is not None
+    clock.value += timedelta(seconds=31)
+    second = repository.claim_agent_job("stable-worker", lease_seconds=30)
+    assert second is not None
+    assert second.attempt == first.attempt + 1
+
+    with pytest.raises(Conflict, match="attempt does not match"):
+        desk.request_tool_call(
+            job_id=second.job_id,
+            job_attempt=first.attempt,
+            tool_name="knowledge_search",
+            arguments={"query": "vpn"},
+            requested_by="stable-worker",
+        )
+    with pytest.raises(Conflict, match="active, unexpired worker attempt"):
+        repository.finish_agent_job(
+            second.job_id,
+            "stable-worker",
+            AgentJobState.SUCCEEDED,
+            expected_attempt=first.attempt,
+            output={"category": "stale"},
+        )
+
+    call = desk.request_tool_call(
+        job_id=second.job_id,
+        job_attempt=second.attempt,
+        tool_name="knowledge_search",
+        arguments={"query": "vpn"},
+        requested_by="stable-worker",
+    )
+    assert call.state == "ready"
+    finished = repository.finish_agent_job(
+        second.job_id,
+        "stable-worker",
+        AgentJobState.SUCCEEDED,
+        expected_attempt=second.attempt,
+        output={"category": "current"},
+    )
+    assert finished.output_payload == {"category": "current"}
 
 
 def test_worker_executes_retrieval_through_allowlisted_tool(tmp_path: Path) -> None:
@@ -158,6 +256,7 @@ def test_write_tool_requires_independent_approval(tmp_path: Path) -> None:
     assert claimed is not None
     call = desk.request_tool_call(
         job_id=job.job_id,
+        job_attempt=claimed.attempt,
         tool_name="transition_issue",
         arguments={"issue_id": issue.issue_id},
         requested_by="worker-a",

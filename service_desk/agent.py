@@ -86,6 +86,7 @@ class AgentWorker:
             if job.capability == "retrieve_knowledge":
                 call = self.desk.request_tool_call(
                     job_id=job.job_id,
+                    job_attempt=job.attempt,
                     tool_name="knowledge_search",
                     arguments={"query": output.get("query", "")},
                     requested_by=self.worker_id,
@@ -102,6 +103,7 @@ class AgentWorker:
                 job.job_id,
                 self.worker_id,
                 AgentJobState.SUCCEEDED,
+                expected_attempt=job.attempt,
                 output=output,
             )
         # The worker is a process boundary: model/tool failures become durable job state.
@@ -110,6 +112,7 @@ class AgentWorker:
                 job.job_id,
                 self.worker_id,
                 AgentJobState.FAILED,
+                expected_attempt=job.attempt,
                 error=f"{type(exc).__name__}: {exc}",
             )
         return AgentExecutionResult(finished, tuple(requested_calls))

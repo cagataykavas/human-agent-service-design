@@ -275,6 +275,7 @@ class ServiceDesk:
         self,
         *,
         job_id: str,
+        job_attempt: int,
         tool_name: str,
         arguments: dict[str, Any],
         requested_by: str,
@@ -296,7 +297,8 @@ class ServiceDesk:
                 requested_by=requested_by,
                 approved_by=None,
                 result=None,
-            )
+            ),
+            expected_job_attempt=job_attempt,
         )
 
     def approve_tool_call(self, call_id: str, *, actor: Actor) -> ToolCall:
