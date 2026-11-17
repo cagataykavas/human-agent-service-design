@@ -99,6 +99,11 @@ stateDiagram-v2
 
 Every job records capability, input, output, error, attempt count, retry budget, lease owner and expiry. A crashed worker cannot strand the job permanently: an expired lease is claimable by another worker. Only the current lease owner may complete a running job.
 
+Completion and tool-call creation are fenced by both the lease owner and the monotonically
+increasing attempt number. The lease must still be unexpired at the write boundary. This matters
+when a restarted worker reuses the same stable worker ID: an earlier process cannot complete or
+request a tool against a newer attempt merely because its textual owner ID matches.
+
 The runnable deterministic model is an offline test double, not a fake claim of LLM quality. A production OpenAI, Azure OpenAI or local model adapter can implement the same `AgentModel` protocol without changing workflow or persistence code.
 
 ### Governed tools

@@ -774,41 +774,54 @@ class SQLiteServiceDeskRepository:
         owner: str,
         state: AgentJobState,
         *,
+        expected_attempt: int,
         output: dict[str, Any] | None = None,
         error: str | None = None,
     ) -> AgentJob:
         if state not in {AgentJobState.SUCCEEDED, AgentJobState.FAILED, AgentJobState.CANCELLED}:
             raise ValueError("finish state must be terminal")
+        if expected_attempt < 1:
+            raise ValueError("expected_attempt must be positive")
+        now = self.now()
         with self._lock, self.connect() as connection:
             cursor = connection.execute(
                 """
                 UPDATE agent_jobs SET state = ?, output_json = ?, error = ?, lease_owner = NULL,
                     lease_until = NULL, updated_at = ?
-                WHERE job_id = ? AND lease_owner = ? AND state = ?
+                WHERE job_id = ? AND lease_owner = ? AND state = ? AND attempt = ?
+                    AND lease_until > ?
                 """,
                 (
                     state.value,
                     _dump(output) if output is not None else None,
                     error[:1000] if error else None,
-                    self.time(self.now()),
+                    self.time(now),
                     job_id,
                     owner,
                     AgentJobState.RUNNING.value,
+                    expected_attempt,
+                    self.time(now),
                 ),
             )
             if cursor.rowcount != 1:
-                raise Conflict("only the active worker lease can finish a running job")
+                raise Conflict("only the active, unexpired worker attempt can finish a running job")
             row = connection.execute(
                 "SELECT * FROM agent_jobs WHERE job_id = ?", (job_id,)
             ).fetchone()
         return self._agent_job(row)
 
-    def create_tool_call(self, call: ToolCall) -> ToolCall:
+    def create_tool_call(self, call: ToolCall, *, expected_job_attempt: int) -> ToolCall:
+        if expected_job_attempt < 1:
+            raise ValueError("expected_job_attempt must be positive")
         now = self.now()
         with self._lock, self.connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
             job = connection.execute(
-                "SELECT state, lease_owner FROM agent_jobs WHERE job_id = ?", (call.job_id,)
+                """
+                SELECT state, lease_owner, lease_until, attempt
+                FROM agent_jobs WHERE job_id = ?
+                """,
+                (call.job_id,),
             ).fetchone()
             if not job:
                 raise NotFound(f"agent job {call.job_id!r} not found")
@@ -816,6 +829,10 @@ class SQLiteServiceDeskRepository:
                 raise Conflict("tool calls can be requested only by a running agent job")
             if job["lease_owner"] != call.requested_by:
                 raise Conflict("tool caller must own the active agent-job lease")
+            if job["attempt"] != expected_job_attempt:
+                raise Conflict("tool caller attempt does not match the active agent-job attempt")
+            if job["lease_until"] is None or job["lease_until"] <= self.time(now):
+                raise Conflict("tool caller lease has expired")
             connection.execute(
                 """
                 INSERT INTO tool_calls(
