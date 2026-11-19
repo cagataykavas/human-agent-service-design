@@ -104,6 +104,14 @@ increasing attempt number. The lease must still be unexpired at the write bounda
 when a restarted worker reuses the same stable worker ID: an earlier process cannot complete or
 request a tool against a newer attempt merely because its textual owner ID matches.
 
+Long-running model and tool work uses a bounded heartbeat interval no greater than half the lease.
+Renewal is transactional and attempt-bound: it can extend only the current unexpired claim and
+cannot revive an expired lease or cross a reclaim boundary. Model adapters receive a cooperative
+`abort_event`; production adapters should poll it while waiting on provider I/O and cancel that
+request when possible. If renewal cannot be proven, the worker sets the abort event and withholds
+subsequent tool execution and terminal job writes. This is fencing, not forced thread termination:
+a non-cooperative model may continue consuming resources until its own deadline returns control.
+
 The runnable deterministic model is an offline test double, not a fake claim of LLM quality. A production OpenAI, Azure OpenAI or local model adapter can implement the same `AgentModel` protocol without changing workflow or persistence code.
 
 ### Governed tools
