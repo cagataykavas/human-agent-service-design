@@ -1,5 +1,6 @@
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from threading import Event, Thread
 
 import pytest
 
@@ -189,6 +190,152 @@ def test_same_worker_id_cannot_reuse_stale_attempt_token(tmp_path: Path) -> None
         output={"category": "current"},
     )
     assert finished.output_payload == {"category": "current"}
+
+
+def test_active_attempt_can_renew_without_reviving_stale_claims(tmp_path: Path) -> None:
+    class Clock:
+        value = datetime(2026, 11, 20, tzinfo=UTC)
+
+        def __call__(self):
+            return self.value
+
+    clock = Clock()
+    repository, desk, issue = setup_desk(tmp_path, clock=clock)
+    desk.request_agent_job(
+        issue.issue_id,
+        "triage",
+        {"summary": issue.summary},
+        actor=Actor("agent-1", ActorRole.AGENT),
+        job_id="job-1",
+    )
+    first = repository.claim_agent_job("worker-a", lease_seconds=30)
+    assert first is not None
+    clock.value += timedelta(seconds=20)
+
+    renewed = repository.renew_agent_job_lease(
+        first.job_id,
+        "worker-a",
+        expected_attempt=first.attempt,
+        lease_seconds=30,
+    )
+
+    assert renewed.lease_until == clock.value + timedelta(seconds=30)
+    clock.value += timedelta(seconds=20)
+    finished = repository.finish_agent_job(
+        renewed.job_id,
+        "worker-a",
+        AgentJobState.SUCCEEDED,
+        expected_attempt=renewed.attempt,
+        output={"category": "incident"},
+    )
+    assert finished.state is AgentJobState.SUCCEEDED
+
+    with pytest.raises(ValueError, match="lease_seconds"):
+        repository.claim_agent_job("worker-b", lease_seconds=0)
+
+
+def test_expired_or_reclaimed_attempt_cannot_renew(tmp_path: Path) -> None:
+    class Clock:
+        value = datetime(2026, 11, 20, tzinfo=UTC)
+
+        def __call__(self):
+            return self.value
+
+    clock = Clock()
+    repository, desk, issue = setup_desk(tmp_path, clock=clock)
+    desk.request_agent_job(
+        issue.issue_id,
+        "triage",
+        {"summary": issue.summary},
+        actor=Actor("agent-1", ActorRole.AGENT),
+        job_id="job-1",
+    )
+    first = repository.claim_agent_job("stable-worker", lease_seconds=30)
+    assert first is not None
+    clock.value += timedelta(seconds=31)
+
+    with pytest.raises(Conflict, match="active, unexpired worker attempt"):
+        repository.renew_agent_job_lease(
+            first.job_id,
+            "stable-worker",
+            expected_attempt=first.attempt,
+        )
+
+    second = repository.claim_agent_job("stable-worker", lease_seconds=30)
+    assert second is not None
+    with pytest.raises(Conflict, match="active, unexpired worker attempt"):
+        repository.renew_agent_job_lease(
+            second.job_id,
+            "stable-worker",
+            expected_attempt=first.attempt,
+        )
+
+
+def test_long_model_observes_abort_and_cannot_execute_tools_after_lease_loss(
+    tmp_path: Path,
+) -> None:
+    class Clock:
+        value = datetime(2026, 11, 20, tzinfo=UTC)
+
+        def __call__(self):
+            return self.value
+
+    class BlockingModel:
+        def __init__(self) -> None:
+            self.started = Event()
+            self.abort_observed = Event()
+
+        def complete(self, capability, payload, *, abort_event):
+            self.started.set()
+            if not abort_event.wait(timeout=2):
+                raise RuntimeError("test model did not receive abort signal")
+            self.abort_observed.set()
+            return {"query": str(payload.get("query", "")), "confidence": 0.8}
+
+    clock = Clock()
+    repository, desk, issue = setup_desk(tmp_path, clock=clock)
+    desk.request_agent_job(
+        issue.issue_id,
+        "retrieve_knowledge",
+        {"query": "VPN authentication runbook"},
+        actor=Actor("agent-1", ActorRole.AGENT),
+        job_id="job-1",
+    )
+    tools = ToolRegistry()
+    tools.register(KnowledgeSearchTool({"kb-1": "VPN authentication runbook"}))
+    model = BlockingModel()
+    worker = AgentWorker(
+        repository,
+        desk,
+        model,
+        tools,
+        worker_id="worker-a",
+        lease_seconds=1,
+        heartbeat_interval_seconds=0.01,
+    )
+    outcome: dict[str, object] = {}
+    thread = Thread(target=lambda: outcome.setdefault("result", worker.run_once()))
+    thread.start()
+    assert model.started.wait(timeout=1)
+    clock.value += timedelta(seconds=2)
+    assert model.abort_observed.wait(timeout=1)
+    thread.join(timeout=1)
+
+    assert not thread.is_alive()
+    result = outcome["result"]
+    assert result is not None
+    assert result.lease_lost is True
+    assert result.tool_calls == ()
+    with repository.connect() as connection:
+        tool_count = connection.execute("SELECT COUNT(*) FROM tool_calls").fetchone()[0]
+        job_row = connection.execute(
+            "SELECT state, output_json, error, attempt FROM agent_jobs WHERE job_id = 'job-1'"
+        ).fetchone()
+    assert tool_count == 0
+    assert tuple(job_row) == (AgentJobState.RUNNING.value, None, None, 1)
+    reclaimed = repository.claim_agent_job("worker-b", lease_seconds=30)
+    assert reclaimed is not None
+    assert reclaimed.attempt == 2
 
 
 def test_worker_executes_retrieval_through_allowlisted_tool(tmp_path: Path) -> None:

@@ -734,6 +734,10 @@ class SQLiteServiceDeskRepository:
         return job
 
     def claim_agent_job(self, owner: str, lease_seconds: int = 60) -> AgentJob | None:
+        if isinstance(lease_seconds, bool) or not isinstance(lease_seconds, int):
+            raise TypeError("lease_seconds must be an integer")
+        if not 1 <= lease_seconds <= 3600:
+            raise ValueError("lease_seconds must be in [1, 3600]")
         now = self.now()
         with self._lock, self.connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
@@ -767,6 +771,49 @@ class SQLiteServiceDeskRepository:
             ).fetchone()
             connection.commit()
         return self._agent_job(claimed)
+
+    def renew_agent_job_lease(
+        self,
+        job_id: str,
+        owner: str,
+        *,
+        expected_attempt: int,
+        lease_seconds: int = 60,
+    ) -> AgentJob:
+        """Extend one active attempt without reviving an expired lease."""
+
+        if expected_attempt < 1:
+            raise ValueError("expected_attempt must be positive")
+        if isinstance(lease_seconds, bool) or not isinstance(lease_seconds, int):
+            raise TypeError("lease_seconds must be an integer")
+        if not 1 <= lease_seconds <= 3600:
+            raise ValueError("lease_seconds must be in [1, 3600]")
+        now = self.now()
+        with self._lock, self.connect() as connection:
+            cursor = connection.execute(
+                """
+                UPDATE agent_jobs SET lease_until = ?, updated_at = ?
+                WHERE job_id = ? AND lease_owner = ? AND state = ? AND attempt = ?
+                    AND lease_until > ?
+                """,
+                (
+                    self.time(now + timedelta(seconds=lease_seconds)),
+                    self.time(now),
+                    job_id,
+                    owner,
+                    AgentJobState.RUNNING.value,
+                    expected_attempt,
+                    self.time(now),
+                ),
+            )
+            if cursor.rowcount != 1:
+                raise Conflict(
+                    "only the active, unexpired worker attempt can renew an agent-job lease"
+                )
+            renewed = connection.execute(
+                "SELECT * FROM agent_jobs WHERE job_id = ?", (job_id,)
+            ).fetchone()
+        return self._agent_job(renewed)
 
     def finish_agent_job(
         self,
